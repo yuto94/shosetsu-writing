@@ -1,0 +1,12 @@
+{
+  "name": "雫 書房",
+  "short_name": "雫 書房",
+  "description": "原稿を端末に守る軽量小説エディタ",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f3efe5",
+  "theme_color": "#173d32",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
