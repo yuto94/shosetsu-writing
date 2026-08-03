@@ -142,7 +142,7 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene;
   );
 }
 
-export function WriterApp({ accountEmail, signOutPath }: { accountEmail: string; signOutPath: string }) {
+export function WriterApp({ accountEmail = "この端末", signOutPath }: { accountEmail?: string; signOutPath?: string }) {
   const [works, setWorks] = useState<Work[]>([]);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
@@ -166,8 +166,10 @@ export function WriterApp({ accountEmail, signOutPath }: { accountEmail: string;
   const fileRef = useRef<HTMLInputElement>(null);
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const supabase = useMemo(() => {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
+    const nextEnv = typeof process !== "undefined" ? process.env : {};
+    const url = viteEnv?.VITE_SUPABASE_URL || nextEnv.NEXT_PUBLIC_SUPABASE_URL;
+    const key = viteEnv?.VITE_SUPABASE_ANON_KEY || nextEnv.NEXT_PUBLIC_SUPABASE_ANON_KEY;
     return url && key ? createClient(url, key) : null;
   }, []);
 
@@ -189,7 +191,7 @@ export function WriterApp({ accountEmail, signOutPath }: { accountEmail: string;
       const hasPin = Boolean(localStorage.getItem("pinHash"));
       setLocked(hasPin); setPinMode(hasPin ? "unlock" : "none"); setReady(true);
     })().catch(() => setReady(true));
-    navigator.serviceWorker?.register("/sw.js");
+    navigator.serviceWorker?.register("./sw.js");
   }, []);
   useEffect(() => {
     if (!supabase) return;
@@ -338,12 +340,12 @@ export function WriterApp({ accountEmail, signOutPath }: { accountEmail: string;
   };
 
   if (!ready) return <div className="loading">書斎を整えています…</div>;
-  if (locked) return <div className="lock"><div className="lockMark"><img src="/icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
+  if (locked) return <div className="lock"><div className="lockMark"><img src="./icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
   if (focus && currentScene) return <div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)}/></div>;
   if (currentScene) return <Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setSceneId(null)} onFocus={setFocus}/>;
 
   return <div className="appShell">
-    <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><img src="/icon.png" alt="" /> 小説執筆</button><nav><button onClick={()=>setMenu("account")}>同期</button><button onClick={()=>setMenu("backup")}>保存</button><button onClick={()=>setMenu("settings")}>設定</button><a className="signOut" href={signOutPath}>ログアウト</a></nav></header>
+    <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><img src="./icon.png" alt="" /> 小説執筆</button><nav><button onClick={()=>setMenu("account")}>同期</button><button onClick={()=>setMenu("backup")}>保存</button><button onClick={()=>setMenu("settings")}>設定</button>{signOutPath && <a className="signOut" href={signOutPath}>ログアウト</a>}</nav></header>
     {!currentWork ? <main className="library">
       <div className="pageIntro"><div><p className="eyebrow">MY MANUSCRIPTS</p><h1>作品</h1><p>端末に保存済み。オフラインでも執筆できます。</p></div><button className="primary" onClick={createWork}>＋ 新しい作品</button></div>
       <div className="workGrid">{sortedWorks.map(w=><article className="workCard" key={w.id} onClick={()=>chooseWork(w.id)}><div className="bookEdge"/><div><small>{fmt(w.updatedAt)} 更新</small><h2>{w.title}</h2><p>{scenes.filter(s=>s.workId===w.id).reduce((n,s)=>n+count(s.content),0).toLocaleString()}字</p></div><div className="cardActions"><button onClick={e=>{e.stopPropagation();rename("work",w.id,w.title)}}>名前変更</button><button onClick={e=>{e.stopPropagation();deleteItem("work",w.id)}}>削除</button></div></article>)}</div>
@@ -359,7 +361,7 @@ export function WriterApp({ accountEmail, signOutPath }: { accountEmail: string;
     {menu!=="none" && <div className="modalBackdrop" onMouseDown={()=>setMenu("none")}><section className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modalClose" onClick={()=>setMenu("none")}>×</button>
       {menu==="settings" && <><p className="eyebrow">PREFERENCES</p><h2>執筆設定</h2><label>表示テーマ<select value={settings.theme} onChange={e=>setSettings({...settings,theme:e.target.value as Settings["theme"]})}><option value="system">端末に合わせる</option><option value="light">ライト</option><option value="dark">ダーク</option></select></label><label>文字サイズ <b>{settings.fontSize}px</b><input type="range" min="15" max="24" value={settings.fontSize} onChange={e=>setSettings({...settings,fontSize:+e.target.value})}/></label><label>行間 <b>{settings.lineHeight}</b><input type="range" min="1.5" max="2.4" step=".1" value={settings.lineHeight} onChange={e=>setSettings({...settings,lineHeight:+e.target.value})}/></label><label>本文幅 <b>{settings.width}px</b><input type="range" min="560" max="980" step="20" value={settings.width} onChange={e=>setSettings({...settings,width:+e.target.value})}/></label><label>自動ロック<select value={settings.lockMinutes} onChange={e=>setSettings({...settings,lockMinutes:e.target.value})}><option value="1">1分</option><option value="5">5分</option><option value="15">15分</option><option value="30">30分</option><option value="close">アプリを閉じたときのみ</option></select></label><button className="primary wide" onClick={()=>{setPinMode("setup");setPin("");}}>PINを設定・変更</button>{pinMode==="setup"&&<div className="pinSetup"><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} type="password" inputMode="numeric" placeholder="4〜6桁"/><button onClick={submitPin}>設定</button><span>{pinError}</span></div>}</>}
       {menu==="backup" && <><p className="eyebrow">BACKUP</p><h2>原稿を守る</h2><p className="modalCopy">バックアップには認証情報やPINは含まれません。</p><button className="primary wide" onClick={backup}>JSONバックアップを保存</button><button className="secondary wide" onClick={exportTxt} disabled={!currentWork}>現在の作品をTXT保存</button><button className="secondary wide" onClick={()=>fileRef.current?.click()}>JSONから復元</button><input ref={fileRef} hidden type="file" accept=".json,application/json" onChange={e=>e.target.files?.[0]&&restore(e.target.files[0])}/></>}
-      {menu==="account" && <><p className="eyebrow">CLOUD SYNC</p><h2>クラウド同期</h2><div className="syncState"><span>●</span><div><b>{user ? `${user.email} で同期中` : `${accountEmail} でアプリにログイン中`}</b><p>アプリをログアウトすると、再認証するまで作品名や本文は表示されません。</p></div></div>{user ? <><button className="primary wide" onClick={syncAll}>今すぐすべて同期</button><button className="secondary wide" onClick={()=>supabase?.auth.signOut()}>Supabase同期を解除</button></> : <><label>同期用メールアドレス<input value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="you@example.com"/></label><label>同期用パスワード<input value={password} onChange={e=>setPassword(e.target.value)} type="password" minLength={8}/></label><button className="primary wide" onClick={()=>signIn(false)}>Supabase同期に接続</button><button className="secondary wide" onClick={()=>signIn(true)}>同期アカウントを新規登録</button></>}<a className="secondary wide modalSignOut" href={signOutPath}>アプリからログアウト</a><p className="finePrint">{cloudMessage || (supabase ? "同期は入力停止から約2秒後に行われます。" : "端末間同期はSupabase設定後に利用できます。")}</p></>}
+      {menu==="account" && <><p className="eyebrow">CLOUD SYNC</p><h2>クラウド同期</h2><div className="syncState"><span>●</span><div><b>{user ? `${user.email} で同期中` : `${accountEmail}で利用中`}</b><p>{signOutPath ? "ログアウト後は、再認証するまで作品名や本文は表示されません。" : "原稿はこのブラウザのIndexedDBに保存され、GitHubには送信されません。"}</p></div></div>{user ? <><button className="primary wide" onClick={syncAll}>今すぐすべて同期</button><button className="secondary wide" onClick={()=>supabase?.auth.signOut()}>Supabase同期を解除</button></> : <><label>同期用メールアドレス<input value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="you@example.com"/></label><label>同期用パスワード<input value={password} onChange={e=>setPassword(e.target.value)} type="password" minLength={8}/></label><button className="primary wide" onClick={()=>signIn(false)}>Supabase同期に接続</button><button className="secondary wide" onClick={()=>signIn(true)}>同期アカウントを新規登録</button></>}{signOutPath && <a className="secondary wide modalSignOut" href={signOutPath}>アプリからログアウト</a>}<p className="finePrint">{cloudMessage || (supabase ? "同期は入力停止から約2秒後に行われます。" : "端末間同期はSupabase設定後に利用できます。")}</p></>}
     </section></div>}
   </div>;
 }

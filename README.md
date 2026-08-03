@@ -13,3 +13,7 @@ PINロックは、端末を一時的に触った人から表示を隠すため�
 ## 開発
 
 `npm run dev`で起動し、`npm run build`で本番ビルドを確認できます。
+
+## GitHub Pages
+
+`npm run build:github`で、ChatGPT認証に依存しない静的版を`github-dist`へ生成します。GitHub Pagesでは原稿はブラウザのIndexedDBにだけ保存され、リポジトリへは送信されません。公開リポジトリへpushすると、`.github/workflows/pages.yml`が自動でPagesへ公開します。
