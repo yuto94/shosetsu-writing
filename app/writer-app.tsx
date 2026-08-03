@@ -338,7 +338,7 @@ export function WriterApp({ accountEmail, signOutPath }: { accountEmail: string;
   };
 
   if (!ready) return <div className="loading">書斎を整えています…</div>;
-  if (locked) return <div className="lock"><div className="lockMark">雫</div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
+  if (locked) return <div className="lock"><div className="lockMark"><img src="/icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
   if (focus && currentScene) return <div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)}/></div>;
   if (currentScene) return <Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setSceneId(null)} onFocus={setFocus}/>;
 
