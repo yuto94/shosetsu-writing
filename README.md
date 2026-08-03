@@ -1,4 +1,4 @@
-# 雫 書房
+# 小説執筆
 
 iPhoneとPCで使える、軽量な小説執筆PWAです。本文は軽量な`textarea`で編集し、IndexedDBを一次保存先にします。
 

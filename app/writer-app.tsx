@@ -343,7 +343,7 @@ export function WriterApp() {
   if (currentScene) return <Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setSceneId(null)} onFocus={setFocus}/>;
 
   return <div className="appShell">
-    <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><span>雫</span> 書房</button><nav><button onClick={()=>setMenu("account")}>同期</button><button onClick={()=>setMenu("backup")}>保存</button><button onClick={()=>setMenu("settings")}>設定</button></nav></header>
+    <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><img src="/icon.png" alt="" /> 小説執筆</button><nav><button onClick={()=>setMenu("account")}>同期</button><button onClick={()=>setMenu("backup")}>保存</button><button onClick={()=>setMenu("settings")}>設定</button></nav></header>
     {!currentWork ? <main className="library">
       <div className="pageIntro"><div><p className="eyebrow">MY MANUSCRIPTS</p><h1>作品</h1><p>端末に保存済み。オフラインでも執筆できます。</p></div><button className="primary" onClick={createWork}>＋ 新しい作品</button></div>
       <div className="workGrid">{sortedWorks.map(w=><article className="workCard" key={w.id} onClick={()=>chooseWork(w.id)}><div className="bookEdge"/><div><small>{fmt(w.updatedAt)} 更新</small><h2>{w.title}</h2><p>{scenes.filter(s=>s.workId===w.id).reduce((n,s)=>n+count(s.content),0).toLocaleString()}字</p></div><div className="cardActions"><button onClick={e=>{e.stopPropagation();rename("work",w.id,w.title)}}>名前変更</button><button onClick={e=>{e.stopPropagation();deleteItem("work",w.id)}}>削除</button></div></article>)}</div>
