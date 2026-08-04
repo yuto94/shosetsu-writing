@@ -79,10 +79,16 @@ async function pinDigest(pin: string, salt: string) {
 function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene; workCount: number; onCommit: (content: string, status: SyncStatus) => void; onBack: () => void; onFocus: (value: boolean) => void }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const draft = useRef(scene.content);
+  const dirty = useRef(false);
+  const onCommitRef = useRef(onCommit);
   const composing = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [status, setStatus] = useState<SyncStatus>(scene.syncStatus);
   const [chars, setChars] = useState(count(scene.content));
+
+  useEffect(() => {
+    onCommitRef.current = onCommit;
+  }, [onCommit]);
 
   const schedule = useCallback(() => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -90,14 +96,16 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene;
     saveTimer.current = setTimeout(() => {
       const next = navigator.onLine ? "saved" : "offline";
       setStatus(next);
-      onCommit(draft.current, next);
+      dirty.current = false;
+      onCommitRef.current(draft.current, next);
       const el = ref.current;
       if (el) localStorage.setItem(`cursor:${scene.id}`, JSON.stringify({ start: el.selectionStart, end: el.selectionEnd, scroll: el.scrollTop }));
     }, 400);
-  }, [onCommit, scene.id]);
+  }, [scene.id]);
 
   useEffect(() => {
     draft.current = scene.content;
+    dirty.current = false;
     const el = ref.current;
     if (el) el.value = scene.content;
     const saved = localStorage.getItem(`cursor:${scene.id}`);
@@ -109,9 +117,18 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene;
     }
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
-      onCommit(draft.current, navigator.onLine ? "saved" : "offline");
+      if (dirty.current) onCommitRef.current(draft.current, navigator.onLine ? "saved" : "offline");
     };
   }, [scene.id]); // Deliberately never resets textarea while typing.
+
+  useEffect(() => {
+    if (dirty.current || composing.current || draft.current === scene.content) return;
+    draft.current = scene.content;
+    setChars(count(scene.content));
+    setStatus(scene.syncStatus);
+    const el = ref.current;
+    if (el) el.value = scene.content;
+  }, [scene.content, scene.revision, scene.syncStatus]);
 
   return (
     <main className="editorShell">
@@ -128,8 +145,9 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene;
         spellCheck={false}
         onCompositionStart={() => { composing.current = true; }}
         onCompositionUpdate={() => { composing.current = true; }}
-        onCompositionEnd={(e) => { composing.current = false; draft.current = e.currentTarget.value; setChars(count(draft.current)); schedule(); }}
+        onCompositionEnd={(e) => { composing.current = false; dirty.current = true; draft.current = e.currentTarget.value; setChars(count(draft.current)); schedule(); }}
         onInput={(e) => {
+          dirty.current = true;
           draft.current = e.currentTarget.value;
           if (!composing.current && !(e.nativeEvent as InputEvent).isComposing) {
             setChars(count(draft.current));
@@ -166,6 +184,8 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   const fileRef = useRef<HTMLInputElement>(null);
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncAllRef = useRef<() => Promise<void>>(async () => {});
+  const syncRunning = useRef(false);
+  const syncQueued = useRef(false);
   const supabase = useMemo(() => {
     const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
     const nextEnv = typeof process !== "undefined" ? process.env : {};
@@ -248,11 +268,19 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   };
   const commit = useCallback(async (content: string, syncStatus: SyncStatus) => {
     if (!sceneId) return;
-    const updatedAt = now();
-    setScenes(prev => prev.map(s => s.id === sceneId ? { ...s, content, updatedAt, revision: s.revision + 1, syncStatus } : s));
     const old = scenes.find(s => s.id === sceneId);
     if (old) {
+      if (old.content === content) {
+        if (old.syncStatus !== syncStatus) {
+          const unchanged = { ...old, syncStatus };
+          setScenes(v => v.map(s => s.id === sceneId ? unchanged : s));
+          await put("scenes", unchanged);
+        }
+        return;
+      }
+      const updatedAt = now();
       const next = { ...old, content, updatedAt, revision: old.revision + 1, syncStatus };
+      setScenes(prev => prev.map(s => s.id === sceneId ? next : s));
       await put("scenes", next);
       if (supabase && user && navigator.onLine) {
         if (syncTimer.current) clearTimeout(syncTimer.current);
@@ -332,59 +360,72 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   };
   const syncAll = useCallback(async () => {
     if (!supabase || !user) return;
+    if (syncRunning.current) {
+      syncQueued.current = true;
+      return;
+    }
+    syncRunning.current = true;
     setCloudMessage("同期中…");
-    const deviceId = localStorage.getItem("deviceId") || uid(); localStorage.setItem("deviceId", deviceId);
-    const [rw, rc, rs] = await Promise.all([
-      supabase.from("works").select("*"),
-      supabase.from("chapters").select("*"),
-      supabase.from("scenes").select("*"),
-    ]);
-    if (rw.error || rc.error || rs.error) {
-      setCloudMessage("受信できませんでした。原稿は端末内に残っています。");
-      return;
-    }
+    try {
+      const deviceId = localStorage.getItem("deviceId") || uid(); localStorage.setItem("deviceId", deviceId);
+      const [rw, rc, rs] = await Promise.all([
+        supabase.from("works").select("*").eq("user_id", user.id),
+        supabase.from("chapters").select("*").eq("user_id", user.id),
+        supabase.from("scenes").select("*").eq("user_id", user.id),
+      ]);
+      if (rw.error || rc.error || rs.error) {
+        setCloudMessage("受信できませんでした。原稿は端末内に残っています。");
+        return;
+      }
 
-    const remoteWorks: Work[] = (rw.data || []).map(x => ({ id:x.id,userId:x.user_id,title:x.title,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
-    const remoteChapters: Chapter[] = (rc.data || []).map(x => ({ id:x.id,workId:x.work_id,userId:x.user_id,title:x.title,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
-    const remoteScenes: Scene[] = (rs.data || []).map(x => ({ id:x.id,workId:x.work_id,chapterId:x.chapter_id,userId:x.user_id,title:x.title,content:x.content,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision,syncStatus:"saved",lastSyncedRevision:x.revision,deviceId:x.device_id }));
+      const remoteWorks: Work[] = (rw.data || []).map(x => ({ id:x.id,userId:x.user_id,title:x.title,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
+      const remoteChapters: Chapter[] = (rc.data || []).map(x => ({ id:x.id,workId:x.work_id,userId:x.user_id,title:x.title,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
+      const remoteScenes: Scene[] = (rs.data || []).map(x => ({ id:x.id,workId:x.work_id,chapterId:x.chapter_id,userId:x.user_id,title:x.title,content:x.content,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision,syncStatus:"saved",lastSyncedRevision:x.revision,deviceId:x.device_id }));
 
-    const mergeLatest = <T extends { id:string; updatedAt:string }>(local:T[], remote:T[]) => {
-      const merged = new Map(local.map(x => [x.id, x]));
-      remote.forEach(x => {
-        const current = merged.get(x.id);
-        if (!current || x.updatedAt > current.updatedAt) merged.set(x.id, x);
+      const mergeLatest = <T extends { id:string; updatedAt:string }>(local:T[], remote:T[]) => {
+        const merged = new Map(local.map(x => [x.id, x]));
+        remote.forEach(x => {
+          const current = merged.get(x.id);
+          if (!current || x.updatedAt > current.updatedAt) merged.set(x.id, x);
+        });
+        return [...merged.values()];
+      };
+      const mergedWorks = mergeLatest(works, remoteWorks);
+      const mergedChapters = mergeLatest(chapters, remoteChapters);
+      const mergedScenes = new Map(scenes.map(s => [s.id, s]));
+      const conflictCopies: Scene[] = [];
+      remoteScenes.forEach(remote => {
+        const local = mergedScenes.get(remote.id);
+        if (!local) { mergedScenes.set(remote.id, remote); return; }
+        const lastSynced = local.lastSyncedRevision || 0;
+        const bothChanged = remote.revision > lastSynced && local.revision > lastSynced && remote.content !== local.content;
+        if (bothChanged) {
+          conflictCopies.push({ ...local, id:uid(), title:`${local.title}（競合コピー）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
+          mergedScenes.set(remote.id, remote);
+        } else if (remote.updatedAt > local.updatedAt) mergedScenes.set(remote.id, remote);
+        else mergedScenes.set(local.id, { ...local, deviceId });
       });
-      return [...merged.values()];
-    };
-    const mergedWorks = mergeLatest(works, remoteWorks);
-    const mergedChapters = mergeLatest(chapters, remoteChapters);
-    const mergedScenes = new Map(scenes.map(s => [s.id, s]));
-    const conflictCopies: Scene[] = [];
-    remoteScenes.forEach(remote => {
-      const local = mergedScenes.get(remote.id);
-      if (!local) { mergedScenes.set(remote.id, remote); return; }
-      const lastSynced = local.lastSyncedRevision || 0;
-      const bothChanged = remote.revision > lastSynced && local.revision > lastSynced && remote.content !== local.content;
-      if (bothChanged) {
-        conflictCopies.push({ ...local, id:uid(), title:`${local.title}（競合コピー）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
-        mergedScenes.set(remote.id, remote);
-      } else if (remote.updatedAt > local.updatedAt) mergedScenes.set(remote.id, remote);
-      else mergedScenes.set(local.id, { ...local, deviceId });
-    });
-    const finalScenes = [...mergedScenes.values(), ...conflictCopies];
+      const finalScenes = [...mergedScenes.values(), ...conflictCopies];
 
-    const ownedWorks = mergedWorks.map(w => ({ id:w.id,user_id:user.id,title:w.title,created_at:w.createdAt,updated_at:w.updatedAt,revision:w.revision }));
-    const ownedChapters = mergedChapters.map(c => ({ id:c.id,work_id:c.workId,user_id:user.id,title:c.title,order:c.order,created_at:c.createdAt,updated_at:c.updatedAt,revision:c.revision }));
-    const ownedScenes = finalScenes.map(s => ({ id:s.id,work_id:s.workId,chapter_id:s.chapterId,user_id:user.id,title:s.title,content:s.content,order:s.order,created_at:s.createdAt,updated_at:s.updatedAt,revision:s.revision,device_id:s.deviceId || deviceId,last_synced_revision:s.revision }));
-    const e1 = await supabase.from("works").upsert(ownedWorks), e2 = await supabase.from("chapters").upsert(ownedChapters), e3 = await supabase.from("scenes").upsert(ownedScenes);
-    if (e1.error || e2.error || e3.error) {
-      setCloudMessage("送信できませんでした。原稿は端末内に残っています。");
-      return;
+      const ownedWorks = mergedWorks.map(w => ({ id:w.id,user_id:user.id,title:w.title,created_at:w.createdAt,updated_at:w.updatedAt,revision:w.revision }));
+      const ownedChapters = mergedChapters.map(c => ({ id:c.id,work_id:c.workId,user_id:user.id,title:c.title,order:c.order,created_at:c.createdAt,updated_at:c.updatedAt,revision:c.revision }));
+      const ownedScenes = finalScenes.map(s => ({ id:s.id,work_id:s.workId,chapter_id:s.chapterId,user_id:user.id,title:s.title,content:s.content,order:s.order,created_at:s.createdAt,updated_at:s.updatedAt,revision:s.revision,device_id:s.deviceId || deviceId,last_synced_revision:s.revision }));
+      const e1 = await supabase.from("works").upsert(ownedWorks), e2 = await supabase.from("chapters").upsert(ownedChapters), e3 = await supabase.from("scenes").upsert(ownedScenes);
+      if (e1.error || e2.error || e3.error) {
+        setCloudMessage("送信できませんでした。原稿は端末内に残っています。");
+        return;
+      }
+      const savedScenes = finalScenes.map(s => ({...s,syncStatus:s.syncStatus === "conflict" ? "conflict" as const : "saved" as const,lastSyncedRevision:s.revision}));
+      await Promise.all([...mergedWorks.map(x=>put("works",x)),...mergedChapters.map(x=>put("chapters",x)),...savedScenes.map(x=>put("scenes",x))]);
+      setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes);
+      setCloudMessage(conflictCopies.length ? `同期しました。競合コピーを${conflictCopies.length}件保存しました。` : "PC・スマホの内容を同期しました。");
+    } finally {
+      syncRunning.current = false;
+      if (syncQueued.current) {
+        syncQueued.current = false;
+        window.setTimeout(() => syncAllRef.current(), 0);
+      }
     }
-    const savedScenes = finalScenes.map(s => ({...s,syncStatus:s.syncStatus === "conflict" ? "conflict" as const : "saved" as const,lastSyncedRevision:s.revision}));
-    await Promise.all([...mergedWorks.map(x=>put("works",x)),...mergedChapters.map(x=>put("chapters",x)),...savedScenes.map(x=>put("scenes",x))]);
-    setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes);
-    setCloudMessage(conflictCopies.length ? `同期しました。競合コピーを${conflictCopies.length}件保存しました。` : "PC・スマホの内容を同期しました。");
   }, [supabase, user, works, chapters, scenes]);
   useEffect(() => {
     syncAllRef.current = syncAll;
@@ -394,9 +435,18 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     if (!user || !ready) return;
     syncAllRef.current();
     const onOnline = () => syncAllRef.current();
+    const onFocus = () => syncAllRef.current();
+    const onVisibility = () => { if (document.visibilityState === "visible") syncAllRef.current(); };
     window.addEventListener("online", onOnline);
-    const timer = window.setInterval(() => syncAllRef.current(), 15_000);
-    return () => { window.removeEventListener("online", onOnline); window.clearInterval(timer); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    const timer = window.setInterval(() => syncAllRef.current(), 5_000);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(timer);
+    };
   }, [user?.id, ready]);
 
   if (!ready) return <div className="loading">書斎を整えています…</div>;
