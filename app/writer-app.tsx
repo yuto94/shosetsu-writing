@@ -6,7 +6,7 @@ import { createClient, type User } from "@supabase/supabase-js";
 type Work = { id: string; userId: string; title: string; createdAt: string; updatedAt: string; revision: number };
 type Chapter = { id: string; workId: string; userId: string; title: string; order: number; createdAt: string; updatedAt: string; revision: number };
 type SyncStatus = "saved" | "saving" | "offline" | "error" | "conflict";
-type Scene = { id: string; workId: string; chapterId: string; userId: string; title: string; content: string; order: number; createdAt: string; updatedAt: string; revision: number; syncStatus: SyncStatus };
+type Scene = { id: string; workId: string; chapterId: string; userId: string; title: string; content: string; order: number; createdAt: string; updatedAt: string; revision: number; syncStatus: SyncStatus; lastSyncedRevision?: number; deviceId?: string };
 type Settings = { theme: "system" | "light" | "dark"; fontSize: number; lineHeight: number; width: number; lockMinutes: string; reopen: boolean; showStatus: boolean };
 type Snapshot = { version: 1; exportedAt: string; works: Work[]; chapters: Chapter[]; scenes: Scene[]; settings: Settings };
 
@@ -165,6 +165,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   });
   const fileRef = useRef<HTMLInputElement>(null);
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const syncAllRef = useRef<() => Promise<void>>(async () => {});
   const supabase = useMemo(() => {
     const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
     const nextEnv = typeof process !== "undefined" ? process.env : {};
@@ -261,7 +262,9 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
             title: next.title, content: next.content, order: next.order, updated_at: next.updatedAt,
             revision: next.revision, device_id: localStorage.getItem("deviceId"), last_synced_revision: next.revision
           });
-          setScenes(v => v.map(x => x.id === next.id ? { ...x, syncStatus: error ? "error" : "saved" } : x));
+          const synced = { ...next, syncStatus: error ? "error" as const : "saved" as const, lastSyncedRevision: error ? next.lastSyncedRevision : next.revision };
+          setScenes(v => v.map(x => x.id === next.id ? synced : x));
+          await put("scenes", synced);
         }, 2000);
       }
     }
@@ -327,17 +330,74 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     const result = register ? await supabase.auth.signUp({ email, password }) : await supabase.auth.signInWithPassword({ email, password });
     setCloudMessage(result.error ? result.error.message : register ? "確認メールを送りました。" : "ログインしました。");
   };
-  const syncAll = async () => {
+  const syncAll = useCallback(async () => {
     if (!supabase || !user) return;
     setCloudMessage("同期中…");
     const deviceId = localStorage.getItem("deviceId") || uid(); localStorage.setItem("deviceId", deviceId);
-    const ownedWorks = works.map(w => ({ id:w.id,user_id:user.id,title:w.title,created_at:w.createdAt,updated_at:w.updatedAt,revision:w.revision }));
-    const ownedChapters = chapters.map(c => ({ id:c.id,work_id:c.workId,user_id:user.id,title:c.title,order:c.order,created_at:c.createdAt,updated_at:c.updatedAt,revision:c.revision }));
-    const ownedScenes = scenes.map(s => ({ id:s.id,work_id:s.workId,chapter_id:s.chapterId,user_id:user.id,title:s.title,content:s.content,order:s.order,created_at:s.createdAt,updated_at:s.updatedAt,revision:s.revision,device_id:deviceId,last_synced_revision:s.revision }));
+    const [rw, rc, rs] = await Promise.all([
+      supabase.from("works").select("*"),
+      supabase.from("chapters").select("*"),
+      supabase.from("scenes").select("*"),
+    ]);
+    if (rw.error || rc.error || rs.error) {
+      setCloudMessage("受信できませんでした。原稿は端末内に残っています。");
+      return;
+    }
+
+    const remoteWorks: Work[] = (rw.data || []).map(x => ({ id:x.id,userId:x.user_id,title:x.title,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
+    const remoteChapters: Chapter[] = (rc.data || []).map(x => ({ id:x.id,workId:x.work_id,userId:x.user_id,title:x.title,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
+    const remoteScenes: Scene[] = (rs.data || []).map(x => ({ id:x.id,workId:x.work_id,chapterId:x.chapter_id,userId:x.user_id,title:x.title,content:x.content,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision,syncStatus:"saved",lastSyncedRevision:x.revision,deviceId:x.device_id }));
+
+    const mergeLatest = <T extends { id:string; updatedAt:string }>(local:T[], remote:T[]) => {
+      const merged = new Map(local.map(x => [x.id, x]));
+      remote.forEach(x => {
+        const current = merged.get(x.id);
+        if (!current || x.updatedAt > current.updatedAt) merged.set(x.id, x);
+      });
+      return [...merged.values()];
+    };
+    const mergedWorks = mergeLatest(works, remoteWorks);
+    const mergedChapters = mergeLatest(chapters, remoteChapters);
+    const mergedScenes = new Map(scenes.map(s => [s.id, s]));
+    const conflictCopies: Scene[] = [];
+    remoteScenes.forEach(remote => {
+      const local = mergedScenes.get(remote.id);
+      if (!local) { mergedScenes.set(remote.id, remote); return; }
+      const lastSynced = local.lastSyncedRevision || 0;
+      const bothChanged = remote.revision > lastSynced && local.revision > lastSynced && remote.content !== local.content;
+      if (bothChanged) {
+        conflictCopies.push({ ...local, id:uid(), title:`${local.title}（競合コピー）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
+        mergedScenes.set(remote.id, remote);
+      } else if (remote.updatedAt > local.updatedAt) mergedScenes.set(remote.id, remote);
+      else mergedScenes.set(local.id, { ...local, deviceId });
+    });
+    const finalScenes = [...mergedScenes.values(), ...conflictCopies];
+
+    const ownedWorks = mergedWorks.map(w => ({ id:w.id,user_id:user.id,title:w.title,created_at:w.createdAt,updated_at:w.updatedAt,revision:w.revision }));
+    const ownedChapters = mergedChapters.map(c => ({ id:c.id,work_id:c.workId,user_id:user.id,title:c.title,order:c.order,created_at:c.createdAt,updated_at:c.updatedAt,revision:c.revision }));
+    const ownedScenes = finalScenes.map(s => ({ id:s.id,work_id:s.workId,chapter_id:s.chapterId,user_id:user.id,title:s.title,content:s.content,order:s.order,created_at:s.createdAt,updated_at:s.updatedAt,revision:s.revision,device_id:s.deviceId || deviceId,last_synced_revision:s.revision }));
     const e1 = await supabase.from("works").upsert(ownedWorks), e2 = await supabase.from("chapters").upsert(ownedChapters), e3 = await supabase.from("scenes").upsert(ownedScenes);
-    if (e1.error || e2.error || e3.error) setCloudMessage("同期できませんでした。原稿は端末内に残っています。");
-    else { setCloudMessage("すべて同期しました。"); setScenes(v=>v.map(s=>({...s,syncStatus:"saved"}))); }
-  };
+    if (e1.error || e2.error || e3.error) {
+      setCloudMessage("送信できませんでした。原稿は端末内に残っています。");
+      return;
+    }
+    const savedScenes = finalScenes.map(s => ({...s,syncStatus:s.syncStatus === "conflict" ? "conflict" as const : "saved" as const,lastSyncedRevision:s.revision}));
+    await Promise.all([...mergedWorks.map(x=>put("works",x)),...mergedChapters.map(x=>put("chapters",x)),...savedScenes.map(x=>put("scenes",x))]);
+    setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes);
+    setCloudMessage(conflictCopies.length ? `同期しました。競合コピーを${conflictCopies.length}件保存しました。` : "PC・スマホの内容を同期しました。");
+  }, [supabase, user, works, chapters, scenes]);
+  useEffect(() => {
+    syncAllRef.current = syncAll;
+  }, [syncAll]);
+
+  useEffect(() => {
+    if (!user || !ready) return;
+    syncAllRef.current();
+    const onOnline = () => syncAllRef.current();
+    window.addEventListener("online", onOnline);
+    const timer = window.setInterval(() => syncAllRef.current(), 15_000);
+    return () => { window.removeEventListener("online", onOnline); window.clearInterval(timer); };
+  }, [user?.id, ready]);
 
   if (!ready) return <div className="loading">書斎を整えています…</div>;
   if (locked) return <div className="lock"><div className="lockMark"><img src="./icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
