@@ -7,11 +7,14 @@ type Work = { id: string; userId: string; title: string; createdAt: string; upda
 type Chapter = { id: string; workId: string; userId: string; title: string; order: number; createdAt: string; updatedAt: string; revision: number };
 type SyncStatus = "saved" | "saving" | "offline" | "error" | "conflict";
 type Scene = { id: string; workId: string; chapterId: string; userId: string; title: string; content: string; order: number; createdAt: string; updatedAt: string; revision: number; syncStatus: SyncStatus; lastSyncedRevision?: number; deviceId?: string };
+type Tombstone = { id: string; itemId: string; itemType: "work" | "chapter" | "scene"; userId: string; deletedAt: string; deviceId?: string };
+type SceneVersion = { id: number; content: string; revision: number; savedAt: string };
 type Settings = { theme: "system" | "light" | "dark"; fontSize: number; lineHeight: number; width: number; lockMinutes: string; reopen: boolean; showStatus: boolean };
 type Snapshot = { version: 1; exportedAt: string; works: Work[]; chapters: Chapter[]; scenes: Scene[]; settings: Settings };
 
 const DB_NAME = "shizuku-writer";
-const STORE_NAMES = ["works", "chapters", "scenes"] as const;
+const CONTENT_STORE_NAMES = ["works", "chapters", "scenes"] as const;
+const STORE_NAMES = [...CONTENT_STORE_NAMES, "tombstones"] as const;
 const DEFAULT_SETTINGS: Settings = { theme: "system", fontSize: 18, lineHeight: 1.9, width: 760, lockMinutes: "5", reopen: true, showStatus: true };
 const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
@@ -20,7 +23,7 @@ const fmt = (iso: string) => new Intl.DateTimeFormat("ja-JP", { month: "short", 
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(DB_NAME, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       STORE_NAMES.forEach((name) => {
@@ -76,7 +79,7 @@ async function pinDigest(pin: string, salt: string) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene; workCount: number; onCommit: (content: string, status: SyncStatus) => void; onBack: () => void; onFocus: (value: boolean) => void }) {
+function Editor({ scene, workCount, onCommit, onBack, onFocus, onHistory }: { scene: Scene; workCount: number; onCommit: (content: string, status: SyncStatus) => void; onBack: () => void; onFocus: (value: boolean) => void; onHistory: () => void }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const draft = useRef(scene.content);
   const dirty = useRef(false);
@@ -135,7 +138,7 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus }: { scene: Scene;
       <header className="editorBar">
         <button className="iconButton" onClick={onBack} aria-label="一覧へ戻る">←</button>
         <div className="sceneHeading"><span>{scene.title}</span><small>{status === "saving" ? "保存中…" : status === "saved" ? "保存済み" : status === "offline" ? "オフライン・端末に保存" : status === "conflict" ? "競合あり" : "同期エラー"}</small></div>
-        <button className="focusButton" onClick={() => onFocus(true)}>集中</button>
+        <div><button className="focusButton" onClick={onHistory}>履歴</button><button className="focusButton" onClick={() => onFocus(true)}>集中</button></div>
       </header>
       <textarea
         ref={ref}
@@ -177,6 +180,8 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   const [password, setPassword] = useState("");
   const [user, setUser] = useState<User | null>(null);
   const [cloudMessage, setCloudMessage] = useState("");
+  const [historyVersions, setHistoryVersions] = useState<SceneVersion[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => {
     if (typeof window === "undefined") return DEFAULT_SETTINGS;
     try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem("writerSettings") || "{}") }; } catch { return DEFAULT_SETTINGS; }
@@ -197,13 +202,14 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   useEffect(() => {
     (async () => {
       let [w, c, s] = await Promise.all([getAll<Work>("works"), getAll<Chapter>("chapters"), getAll<Scene>("scenes")]);
-      if (!w.length) {
+      if (!w.length && !localStorage.getItem("writerInitialized")) {
         const t = now(), wid = uid(), cid = uid(), sid = uid();
         w = [{ id: wid, userId: "local", title: "夜の森で、あなたを待つ", createdAt: t, updatedAt: t, revision: 1 }];
         c = [{ id: cid, workId: wid, userId: "local", title: "第1章　はじまり", order: 0, createdAt: t, updatedAt: t, revision: 1 }];
         s = [{ id: sid, workId: wid, chapterId: cid, userId: "local", title: "シーン1", content: "雨の匂いが、まだ窓辺に残っていた。\n\n", order: 0, createdAt: t, updatedAt: t, revision: 1, syncStatus: "saved" }];
         await Promise.all([put("works", w[0]), put("chapters", c[0]), put("scenes", s[0])]);
       }
+      localStorage.setItem("writerInitialized", "1");
       setWorks(w); setChapters(c); setScenes(s);
       const lastWork = localStorage.getItem("lastWorkId");
       const lastScene = localStorage.getItem("lastSceneId");
@@ -266,6 +272,34 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     const s: Scene = { id: uid(), workId, chapterId, userId: "local", title: `シーン${same.length + 1}`, content: "", order: same.length, createdAt: t, updatedAt: t, revision: 1, syncStatus: "saved" };
     await put("scenes", s); setScenes(v => [...v, s]); setSceneId(s.id); localStorage.setItem("lastSceneId", s.id);
   };
+  const saveSceneToCloud = useCallback(async (scene: Scene, expectedRevision: number) => {
+    if (!supabase || !user || !navigator.onLine) return { status: "offline" as const };
+    const deviceId = localStorage.getItem("deviceId") || uid();
+    localStorage.setItem("deviceId", deviceId);
+    const { data, error } = await supabase.rpc("save_scene_if_current", {
+      p_scene_id: scene.id,
+      p_work_id: scene.workId,
+      p_chapter_id: scene.chapterId,
+      p_title: scene.title,
+      p_content: scene.content,
+      p_order: scene.order,
+      p_expected_revision: expectedRevision,
+      p_created_at: scene.createdAt,
+      p_device_id: deviceId,
+    });
+    if (error) return { status: "error" as const, error };
+    const result = data?.[0];
+    if (result?.status === "saved") {
+      return {
+        status: "saved" as const,
+        revision: Number(result.server_revision),
+        updatedAt: result.server_updated_at as string,
+        deviceId,
+      };
+    }
+    return { status: "conflict" as const, revision: Number(result?.server_revision || 0) };
+  }, [supabase, user]);
+
   const commit = useCallback(async (content: string, syncStatus: SyncStatus) => {
     if (!sceneId) return;
     const old = scenes.find(s => s.id === sceneId);
@@ -285,27 +319,80 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       if (supabase && user && navigator.onLine) {
         if (syncTimer.current) clearTimeout(syncTimer.current);
         syncTimer.current = setTimeout(async () => {
-          const { error } = await supabase.from("scenes").upsert({
-            id: next.id, work_id: next.workId, chapter_id: next.chapterId, user_id: user.id,
-            title: next.title, content: next.content, order: next.order, updated_at: next.updatedAt,
-            revision: next.revision, device_id: localStorage.getItem("deviceId"), last_synced_revision: next.revision
-          });
-          const synced = { ...next, syncStatus: error ? "error" as const : "saved" as const, lastSyncedRevision: error ? next.lastSyncedRevision : next.revision };
+          const result = await saveSceneToCloud(next, old.lastSyncedRevision || 0);
+          const synced = result.status === "saved"
+            ? { ...next, updatedAt: result.updatedAt, revision: result.revision, syncStatus: "saved" as const, lastSyncedRevision: result.revision, deviceId: result.deviceId }
+            : { ...next, syncStatus: result.status === "conflict" ? "conflict" as const : "error" as const };
           setScenes(v => v.map(x => x.id === next.id ? synced : x));
           await put("scenes", synced);
+          if (result.status === "conflict") {
+            setCloudMessage("別の端末にも新しい本文があります。どちらも残して同期します。");
+            syncAllRef.current();
+          }
         }, 2000);
       }
     }
-  }, [sceneId, scenes, supabase, user]);
+  }, [sceneId, scenes, supabase, user, saveSceneToCloud]);
+  const openHistory = async () => {
+    if (!currentScene || !supabase || !user) {
+      alert("履歴はクラウド同期への接続後に利用できます。");
+      return;
+    }
+    const { data, error } = await supabase
+      .from("scene_versions")
+      .select("id,content,revision,saved_at")
+      .eq("scene_id", currentScene.id)
+      .eq("user_id", user.id)
+      .order("saved_at", { ascending:false })
+      .limit(100);
+    if (error) {
+      alert("履歴を読み込めませんでした。現在の本文は変更されていません。");
+      return;
+    }
+    setHistoryVersions((data || []).map(x => ({ id:x.id,content:x.content,revision:x.revision,savedAt:x.saved_at })));
+    setHistoryOpen(true);
+  };
+  const restoreVersion = async (version: SceneVersion) => {
+    if (!confirm(`${fmt(version.savedAt)}の本文を復元しますか？ 現在の本文も履歴に残ります。`)) return;
+    await commit(version.content, navigator.onLine ? "saved" : "offline");
+    setHistoryOpen(false);
+  };
   const rename = async (kind: "work" | "chapter" | "scene", id: string, old: string) => {
     const title = prompt("新しいタイトル", old)?.trim(); if (!title) return;
     if (kind === "work") { const item = works.find(x => x.id === id)!; const next = { ...item, title, updatedAt: now(), revision: item.revision + 1 }; setWorks(v => v.map(x => x.id === id ? next : x)); await put("works", next); }
     if (kind === "chapter") { const item = chapters.find(x => x.id === id)!; const next = { ...item, title, updatedAt: now(), revision: item.revision + 1 }; setChapters(v => v.map(x => x.id === id ? next : x)); await put("chapters", next); }
     if (kind === "scene") { const item = scenes.find(x => x.id === id)!; const next = { ...item, title, updatedAt: now(), revision: item.revision + 1 }; setScenes(v => v.map(x => x.id === id ? next : x)); await put("scenes", next); }
   };
+  const recordDeletion = async (itemType: Tombstone["itemType"], itemId: string) => {
+    const deviceId = localStorage.getItem("deviceId") || uid();
+    localStorage.setItem("deviceId", deviceId);
+    const tombstone: Tombstone = {
+      id: `${itemType}:${itemId}`,
+      itemId,
+      itemType,
+      userId: user?.id || "local",
+      deletedAt: now(),
+      deviceId,
+    };
+    await put("tombstones", tombstone);
+    if (supabase && user && navigator.onLine) {
+      const { error } = await supabase.from("deletion_tombstones").upsert({
+        user_id: user.id,
+        item_type: itemType,
+        item_id: itemId,
+        deleted_at: tombstone.deletedAt,
+        device_id: deviceId,
+      });
+      if (!error) {
+        const table = itemType === "work" ? "works" : itemType === "chapter" ? "chapters" : "scenes";
+        await supabase.from(table).delete().eq("id", itemId).eq("user_id", user.id);
+      }
+    }
+  };
   const deleteItem = async (kind: "work" | "chapter" | "scene", id: string) => {
     if (!confirm("削除しますか？ この操作は元に戻せません。")) return;
-    if (kind === "scene") { await remove("scenes", id); setScenes(v => v.filter(x => x.id !== id)); }
+    await recordDeletion(kind, id);
+    if (kind === "scene") { await remove("scenes", id); setScenes(v => v.filter(x => x.id !== id)); setSceneId(null); }
     if (kind === "chapter") {
       const ids = scenes.filter(x => x.chapterId === id).map(x => x.id); await Promise.all(ids.map(x => remove("scenes", x))); await remove("chapters", id);
       setScenes(v => v.filter(x => x.chapterId !== id)); setChapters(v => v.filter(x => x.id !== id));
@@ -333,7 +420,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       if (!Array.isArray(data.works) || !Array.isArray(data.chapters) || !Array.isArray(data.scenes)) throw new Error();
       backup();
       const replace = confirm("「OK」で全置換、「キャンセル」で追加インポートします。");
-      if (replace) await Promise.all(STORE_NAMES.map(clearStore));
+      if (replace) await Promise.all(CONTENT_STORE_NAMES.map(clearStore));
       const existing = new Set([...works, ...chapters, ...scenes].map(x => x.id));
       const map = new Map<string,string>();
       const remap = (id: string) => { if (!existing.has(id)) return id; if (!map.has(id)) map.set(id, uid()); return map.get(id)!; };
@@ -368,19 +455,66 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     setCloudMessage("同期中…");
     try {
       const deviceId = localStorage.getItem("deviceId") || uid(); localStorage.setItem("deviceId", deviceId);
-      const [rw, rc, rs] = await Promise.all([
+      const localTombstones = await getAll<Tombstone>("tombstones");
+      const [rw, rc, rs, rt] = await Promise.all([
         supabase.from("works").select("*").eq("user_id", user.id),
         supabase.from("chapters").select("*").eq("user_id", user.id),
         supabase.from("scenes").select("*").eq("user_id", user.id),
+        supabase.from("deletion_tombstones").select("*").eq("user_id", user.id),
       ]);
-      if (rw.error || rc.error || rs.error) {
+      if (rw.error || rc.error || rs.error || rt.error) {
         setCloudMessage("受信できませんでした。原稿は端末内に残っています。");
         return;
       }
 
-      const remoteWorks: Work[] = (rw.data || []).map(x => ({ id:x.id,userId:x.user_id,title:x.title,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
-      const remoteChapters: Chapter[] = (rc.data || []).map(x => ({ id:x.id,workId:x.work_id,userId:x.user_id,title:x.title,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
-      const remoteScenes: Scene[] = (rs.data || []).map(x => ({ id:x.id,workId:x.work_id,chapterId:x.chapter_id,userId:x.user_id,title:x.title,content:x.content,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision,syncStatus:"saved",lastSyncedRevision:x.revision,deviceId:x.device_id }));
+      const remoteTombstones: Tombstone[] = (rt.data || []).map(x => ({
+        id: `${x.item_type}:${x.item_id}`,
+        itemId: x.item_id,
+        itemType: x.item_type,
+        userId: x.user_id,
+        deletedAt: x.deleted_at,
+        deviceId: x.device_id,
+      }));
+      const tombstoneMap = new Map<string, Tombstone>();
+      [...localTombstones, ...remoteTombstones].forEach(t => {
+        const current = tombstoneMap.get(t.id);
+        if (!current || t.deletedAt > current.deletedAt) tombstoneMap.set(t.id, t);
+      });
+      const tombstones = [...tombstoneMap.values()];
+      const deletedWorks = new Set(tombstones.filter(t => t.itemType === "work").map(t => t.itemId));
+      const deletedChapters = new Set(tombstones.filter(t => t.itemType === "chapter").map(t => t.itemId));
+      const deletedScenes = new Set(tombstones.filter(t => t.itemType === "scene").map(t => t.itemId));
+
+      const activeWorks = works.filter(w => !deletedWorks.has(w.id));
+      const activeChapters = chapters.filter(c => !deletedWorks.has(c.workId) && !deletedChapters.has(c.id));
+      const activeScenes = scenes.filter(s => !deletedWorks.has(s.workId) && !deletedChapters.has(s.chapterId) && !deletedScenes.has(s.id));
+      await Promise.all([
+        ...works.filter(w => deletedWorks.has(w.id)).map(w => remove("works", w.id)),
+        ...chapters.filter(c => deletedWorks.has(c.workId) || deletedChapters.has(c.id)).map(c => remove("chapters", c.id)),
+        ...scenes.filter(s => deletedWorks.has(s.workId) || deletedChapters.has(s.chapterId) || deletedScenes.has(s.id)).map(s => remove("scenes", s.id)),
+        ...tombstones.map(t => put("tombstones", t)),
+      ]);
+
+      if (tombstones.length) {
+        const { error: tombstoneError } = await supabase.from("deletion_tombstones").upsert(tombstones.map(t => ({
+          user_id: user.id,
+          item_type: t.itemType,
+          item_id: t.itemId,
+          deleted_at: t.deletedAt,
+          device_id: t.deviceId || deviceId,
+        })));
+        if (tombstoneError) {
+          setCloudMessage("削除情報を送信できませんでした。端末内には保持しています。");
+          return;
+        }
+        await Promise.all(tombstones.filter(t => t.itemType === "scene").map(t => supabase.from("scenes").delete().eq("id", t.itemId).eq("user_id", user.id)));
+        await Promise.all(tombstones.filter(t => t.itemType === "chapter").map(t => supabase.from("chapters").delete().eq("id", t.itemId).eq("user_id", user.id)));
+        await Promise.all(tombstones.filter(t => t.itemType === "work").map(t => supabase.from("works").delete().eq("id", t.itemId).eq("user_id", user.id)));
+      }
+
+      const remoteWorks: Work[] = (rw.data || []).filter(x => !deletedWorks.has(x.id)).map(x => ({ id:x.id,userId:x.user_id,title:x.title,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
+      const remoteChapters: Chapter[] = (rc.data || []).filter(x => !deletedWorks.has(x.work_id) && !deletedChapters.has(x.id)).map(x => ({ id:x.id,workId:x.work_id,userId:x.user_id,title:x.title,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
+      const remoteScenes: Scene[] = (rs.data || []).filter(x => !deletedWorks.has(x.work_id) && !deletedChapters.has(x.chapter_id) && !deletedScenes.has(x.id)).map(x => ({ id:x.id,workId:x.work_id,chapterId:x.chapter_id,userId:x.user_id,title:x.title,content:x.content,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision,syncStatus:"saved",lastSyncedRevision:x.revision,deviceId:x.device_id }));
 
       const mergeLatest = <T extends { id:string; updatedAt:string }>(local:T[], remote:T[]) => {
         const merged = new Map(local.map(x => [x.id, x]));
@@ -390,32 +524,61 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
         });
         return [...merged.values()];
       };
-      const mergedWorks = mergeLatest(works, remoteWorks);
-      const mergedChapters = mergeLatest(chapters, remoteChapters);
-      const mergedScenes = new Map(scenes.map(s => [s.id, s]));
+      const mergedWorks = mergeLatest(activeWorks, remoteWorks);
+      const mergedChapters = mergeLatest(activeChapters, remoteChapters);
+      const remoteSceneMap = new Map(remoteScenes.map(s => [s.id, s]));
+      const mergedScenes = new Map<string, Scene>();
       const conflictCopies: Scene[] = [];
-      remoteScenes.forEach(remote => {
-        const local = mergedScenes.get(remote.id);
-        if (!local) { mergedScenes.set(remote.id, remote); return; }
+      for (const local of activeScenes) {
+        const remote = remoteSceneMap.get(local.id);
+        if (!remote) {
+          mergedScenes.set(local.id, local);
+          continue;
+        }
         const lastSynced = local.lastSyncedRevision || 0;
-        const bothChanged = remote.revision > lastSynced && local.revision > lastSynced && remote.content !== local.content;
-        if (bothChanged) {
-          conflictCopies.push({ ...local, id:uid(), title:`${local.title}（競合コピー）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
+        const differs = remote.content !== local.content || remote.title !== local.title || remote.order !== local.order;
+        const localChanged = differs && local.revision > lastSynced;
+        const remoteChanged = differs && remote.revision > lastSynced;
+        if (localChanged && remoteChanged) {
+          conflictCopies.push({ ...local, id:uid(), title:`${local.title}（別端末の編集も保存）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
           mergedScenes.set(remote.id, remote);
-        } else if (remote.updatedAt > local.updatedAt) mergedScenes.set(remote.id, remote);
-        else mergedScenes.set(local.id, { ...local, deviceId });
-      });
-      const finalScenes = [...mergedScenes.values(), ...conflictCopies];
+        } else if (localChanged) {
+          const result = await saveSceneToCloud(local, remote.revision);
+          if (result.status === "saved") {
+            mergedScenes.set(local.id, { ...local, updatedAt:result.updatedAt,revision:result.revision,lastSyncedRevision:result.revision,deviceId:result.deviceId,syncStatus:"saved" });
+          } else {
+            conflictCopies.push({ ...local, id:uid(), title:`${local.title}（別端末の編集も保存）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
+            mergedScenes.set(remote.id, remote);
+          }
+        } else {
+          mergedScenes.set(remote.id, remote);
+        }
+        remoteSceneMap.delete(remote.id);
+      }
+      remoteSceneMap.forEach(remote => mergedScenes.set(remote.id, remote));
 
       const ownedWorks = mergedWorks.map(w => ({ id:w.id,user_id:user.id,title:w.title,created_at:w.createdAt,updated_at:w.updatedAt,revision:w.revision }));
       const ownedChapters = mergedChapters.map(c => ({ id:c.id,work_id:c.workId,user_id:user.id,title:c.title,order:c.order,created_at:c.createdAt,updated_at:c.updatedAt,revision:c.revision }));
-      const ownedScenes = finalScenes.map(s => ({ id:s.id,work_id:s.workId,chapter_id:s.chapterId,user_id:user.id,title:s.title,content:s.content,order:s.order,created_at:s.createdAt,updated_at:s.updatedAt,revision:s.revision,device_id:s.deviceId || deviceId,last_synced_revision:s.revision }));
-      const e1 = await supabase.from("works").upsert(ownedWorks), e2 = await supabase.from("chapters").upsert(ownedChapters), e3 = await supabase.from("scenes").upsert(ownedScenes);
-      if (e1.error || e2.error || e3.error) {
+      const e1 = ownedWorks.length ? await supabase.from("works").upsert(ownedWorks) : { error:null };
+      const e2 = ownedChapters.length ? await supabase.from("chapters").upsert(ownedChapters) : { error:null };
+      if (e1.error || e2.error) {
         setCloudMessage("送信できませんでした。原稿は端末内に残っています。");
         return;
       }
-      const savedScenes = finalScenes.map(s => ({...s,syncStatus:s.syncStatus === "conflict" ? "conflict" as const : "saved" as const,lastSyncedRevision:s.revision}));
+
+      for (const scene of [...mergedScenes.values(), ...conflictCopies]) {
+        if (remoteScenes.some(remote => remote.id === scene.id)) continue;
+        const result = await saveSceneToCloud(scene, 0);
+        if (result.status === "saved") {
+          mergedScenes.set(scene.id, { ...scene, updatedAt:result.updatedAt,revision:result.revision,lastSyncedRevision:result.revision,deviceId:result.deviceId,syncStatus:scene.syncStatus });
+        } else {
+          mergedScenes.set(scene.id, { ...scene, syncStatus:"error" });
+        }
+      }
+      conflictCopies.forEach(copy => {
+        if (!mergedScenes.has(copy.id)) mergedScenes.set(copy.id, copy);
+      });
+      const savedScenes = [...mergedScenes.values()];
       await Promise.all([...mergedWorks.map(x=>put("works",x)),...mergedChapters.map(x=>put("chapters",x)),...savedScenes.map(x=>put("scenes",x))]);
       setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes);
       setCloudMessage(conflictCopies.length ? `同期しました。競合コピーを${conflictCopies.length}件保存しました。` : "PC・スマホの内容を同期しました。");
@@ -426,7 +589,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
         window.setTimeout(() => syncAllRef.current(), 0);
       }
     }
-  }, [supabase, user, works, chapters, scenes]);
+  }, [supabase, user, works, chapters, scenes, saveSceneToCloud]);
   useEffect(() => {
     syncAllRef.current = syncAll;
   }, [syncAll]);
@@ -449,10 +612,24 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     };
   }, [user?.id, ready]);
 
+  const historyModal = historyOpen && <div className="modalBackdrop"><section className="modal">
+    <button className="modalClose" onClick={()=>setHistoryOpen(false)}>×</button>
+    <p className="eyebrow">VERSION HISTORY</p>
+    <h2>本文の履歴</h2>
+    <p className="modalCopy">保存された本文は上書きせず残しています。選んだ時点へいつでも戻せます。</p>
+    <div className="historyList">
+      {historyVersions.map(version => <article className="sceneRow" key={version.id}>
+        <div><h3>{fmt(version.savedAt)}</h3><p>{count(version.content).toLocaleString()}字 · 第{version.revision}版</p><p>{version.content.slice(0,80) || "（空の本文）"}</p></div>
+        <button className="secondary" onClick={()=>restoreVersion(version)}>この本文を復元</button>
+      </article>)}
+      {!historyVersions.length && <p>まだクラウド履歴がありません。</p>}
+    </div>
+  </section></div>;
+
   if (!ready) return <div className="loading">書斎を整えています…</div>;
   if (locked) return <div className="lock"><div className="lockMark"><img src="./icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
-  if (focus && currentScene) return <div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)}/></div>;
-  if (currentScene) return <Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setSceneId(null)} onFocus={setFocus}/>;
+  if (focus && currentScene) return <><div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)} onHistory={openHistory}/></div>{historyModal}</>;
+  if (currentScene) return <><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setSceneId(null)} onFocus={setFocus} onHistory={openHistory}/>{historyModal}</>;
 
   return <div className="appShell">
     <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><img src="./icon.png" alt="" /> 小説執筆</button><nav><button onClick={()=>setMenu("account")}>同期</button><button onClick={()=>setMenu("backup")}>保存</button><button onClick={()=>setMenu("settings")}>設定</button>{signOutPath && <a className="signOut" href={signOutPath}>ログアウト</a>}</nav></header>
