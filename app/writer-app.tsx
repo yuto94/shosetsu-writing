@@ -79,7 +79,7 @@ async function pinDigest(pin: string, salt: string) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function Editor({ scene, workCount, onCommit, onBack, onFocus, onHistory }: { scene: Scene; workCount: number; onCommit: (content: string, status: SyncStatus) => void; onBack: () => void; onFocus: (value: boolean) => void; onHistory: () => void }) {
+function Editor({ scene, workCount, onCommit, onSync, onBack, onFocus, onHistory }: { scene: Scene; workCount: number; onCommit: (content: string, status: SyncStatus) => Promise<void>; onSync: () => Promise<void>; onBack: () => void; onFocus: (value: boolean) => void; onHistory: () => void }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const draft = useRef(scene.content);
   const dirty = useRef(false);
@@ -95,12 +95,11 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus, onHistory }: { sc
 
   const schedule = useCallback(() => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    setStatus(navigator.onLine ? "saving" : "offline");
+    setStatus("saving");
     saveTimer.current = setTimeout(() => {
-      const next = navigator.onLine ? "saved" : "offline";
-      setStatus(next);
+      setStatus("offline");
       dirty.current = false;
-      onCommitRef.current(draft.current, next);
+      onCommitRef.current(draft.current, "offline");
       const el = ref.current;
       if (el) localStorage.setItem(`cursor:${scene.id}`, JSON.stringify({ start: el.selectionStart, end: el.selectionEnd, scroll: el.scrollTop }));
     }, 400);
@@ -120,7 +119,7 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus, onHistory }: { sc
     }
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
-      if (dirty.current) onCommitRef.current(draft.current, navigator.onLine ? "saved" : "offline");
+      if (dirty.current) onCommitRef.current(draft.current, "offline");
     };
   }, [scene.id]); // Deliberately never resets textarea while typing.
 
@@ -137,8 +136,14 @@ function Editor({ scene, workCount, onCommit, onBack, onFocus, onHistory }: { sc
     <main className="editorShell">
       <header className="editorBar">
         <button className="iconButton" onClick={onBack} aria-label="一覧へ戻る">←</button>
-        <div className="sceneHeading"><span>{scene.title}</span><small>{status === "saving" ? "保存中…" : status === "saved" ? "保存済み" : status === "offline" ? "オフライン・端末に保存" : status === "conflict" ? "競合あり" : "同期エラー"}</small></div>
-        <div><button className="focusButton" onClick={onHistory}>履歴</button><button className="focusButton" onClick={() => onFocus(true)}>集中</button></div>
+        <div className="sceneHeading"><span>{scene.title}</span><small>{status === "saving" ? "端末に保存中…" : status === "saved" ? "同期済み" : status === "offline" ? "端末に保存済み" : status === "conflict" ? "未同期の編集あり" : "同期エラー"}</small></div>
+        <div className="editorActions"><button className="syncButton" onClick={async () => {
+          if (saveTimer.current) clearTimeout(saveTimer.current);
+          dirty.current = false;
+          setStatus("offline");
+          await onCommitRef.current(draft.current, "offline");
+          await onSync();
+        }}>保存・同期する</button><button className="focusButton" onClick={onHistory}>履歴</button><button className="focusButton" onClick={() => onFocus(true)}>集中</button></div>
       </header>
       <textarea
         ref={ref}
@@ -187,10 +192,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem("writerSettings") || "{}") }; } catch { return DEFAULT_SETTINGS; }
   });
   const fileRef = useRef<HTMLInputElement>(null);
-  const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const syncAllRef = useRef<() => Promise<void>>(async () => {});
   const syncRunning = useRef(false);
-  const syncQueued = useRef(false);
   const supabase = useMemo(() => {
     const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
     const nextEnv = typeof process !== "undefined" ? process.env : {};
@@ -316,23 +318,8 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       const next = { ...old, content, updatedAt, revision: old.revision + 1, syncStatus };
       setScenes(prev => prev.map(s => s.id === sceneId ? next : s));
       await put("scenes", next);
-      if (supabase && user && navigator.onLine) {
-        if (syncTimer.current) clearTimeout(syncTimer.current);
-        syncTimer.current = setTimeout(async () => {
-          const result = await saveSceneToCloud(next, old.lastSyncedRevision || 0);
-          const synced = result.status === "saved"
-            ? { ...next, updatedAt: result.updatedAt, revision: result.revision, syncStatus: "saved" as const, lastSyncedRevision: result.revision, deviceId: result.deviceId }
-            : { ...next, syncStatus: result.status === "conflict" ? "conflict" as const : "error" as const };
-          setScenes(v => v.map(x => x.id === next.id ? synced : x));
-          await put("scenes", synced);
-          if (result.status === "conflict") {
-            setCloudMessage("別の端末にも新しい本文があります。どちらも残して同期します。");
-            syncAllRef.current();
-          }
-        }, 2000);
-      }
     }
-  }, [sceneId, scenes, supabase, user, saveSceneToCloud]);
+  }, [sceneId, scenes]);
   const openHistory = async () => {
     if (!currentScene || !supabase || !user) {
       alert("履歴はクラウド同期への接続後に利用できます。");
@@ -354,7 +341,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   };
   const restoreVersion = async (version: SceneVersion) => {
     if (!confirm(`${fmt(version.savedAt)}の本文を復元しますか？ 現在の本文も履歴に残ります。`)) return;
-    await commit(version.content, navigator.onLine ? "saved" : "offline");
+    await commit(version.content, "offline");
     setHistoryOpen(false);
   };
   const rename = async (kind: "work" | "chapter" | "scene", id: string, old: string) => {
@@ -375,19 +362,6 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       deviceId,
     };
     await put("tombstones", tombstone);
-    if (supabase && user && navigator.onLine) {
-      const { error } = await supabase.from("deletion_tombstones").upsert({
-        user_id: user.id,
-        item_type: itemType,
-        item_id: itemId,
-        deleted_at: tombstone.deletedAt,
-        device_id: deviceId,
-      });
-      if (!error) {
-        const table = itemType === "work" ? "works" : itemType === "chapter" ? "chapters" : "scenes";
-        await supabase.from(table).delete().eq("id", itemId).eq("user_id", user.id);
-      }
-    }
   };
   const deleteItem = async (kind: "work" | "chapter" | "scene", id: string) => {
     if (!confirm("削除しますか？ この操作は元に戻せません。")) return;
@@ -446,16 +420,26 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     setCloudMessage(result.error ? result.error.message : register ? "確認メールを送りました。" : "ログインしました。");
   };
   const syncAll = useCallback(async () => {
-    if (!supabase || !user) return;
-    if (syncRunning.current) {
-      syncQueued.current = true;
+    if (!supabase || !user) {
+      setCloudMessage("先に同期アカウントへログインしてください。");
+      setMenu("account");
       return;
     }
+    if (!navigator.onLine) {
+      setCloudMessage("オフラインです。本文は端末内に保存されています。");
+      return;
+    }
+    if (syncRunning.current) return;
     syncRunning.current = true;
     setCloudMessage("同期中…");
     try {
       const deviceId = localStorage.getItem("deviceId") || uid(); localStorage.setItem("deviceId", deviceId);
-      const localTombstones = await getAll<Tombstone>("tombstones");
+      const [localWorks, localChapters, localScenes, localTombstones] = await Promise.all([
+        getAll<Work>("works"),
+        getAll<Chapter>("chapters"),
+        getAll<Scene>("scenes"),
+        getAll<Tombstone>("tombstones"),
+      ]);
       const [rw, rc, rs, rt] = await Promise.all([
         supabase.from("works").select("*").eq("user_id", user.id),
         supabase.from("chapters").select("*").eq("user_id", user.id),
@@ -485,13 +469,13 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       const deletedChapters = new Set(tombstones.filter(t => t.itemType === "chapter").map(t => t.itemId));
       const deletedScenes = new Set(tombstones.filter(t => t.itemType === "scene").map(t => t.itemId));
 
-      const activeWorks = works.filter(w => !deletedWorks.has(w.id));
-      const activeChapters = chapters.filter(c => !deletedWorks.has(c.workId) && !deletedChapters.has(c.id));
-      const activeScenes = scenes.filter(s => !deletedWorks.has(s.workId) && !deletedChapters.has(s.chapterId) && !deletedScenes.has(s.id));
+      const activeWorks = localWorks.filter(w => !deletedWorks.has(w.id));
+      const activeChapters = localChapters.filter(c => !deletedWorks.has(c.workId) && !deletedChapters.has(c.id));
+      const activeScenes = localScenes.filter(s => !deletedWorks.has(s.workId) && !deletedChapters.has(s.chapterId) && !deletedScenes.has(s.id));
       await Promise.all([
-        ...works.filter(w => deletedWorks.has(w.id)).map(w => remove("works", w.id)),
-        ...chapters.filter(c => deletedWorks.has(c.workId) || deletedChapters.has(c.id)).map(c => remove("chapters", c.id)),
-        ...scenes.filter(s => deletedWorks.has(s.workId) || deletedChapters.has(s.chapterId) || deletedScenes.has(s.id)).map(s => remove("scenes", s.id)),
+        ...localWorks.filter(w => deletedWorks.has(w.id)).map(w => remove("works", w.id)),
+        ...localChapters.filter(c => deletedWorks.has(c.workId) || deletedChapters.has(c.id)).map(c => remove("chapters", c.id)),
+        ...localScenes.filter(s => deletedWorks.has(s.workId) || deletedChapters.has(s.chapterId) || deletedScenes.has(s.id)).map(s => remove("scenes", s.id)),
         ...tombstones.map(t => put("tombstones", t)),
       ]);
 
@@ -528,7 +512,6 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       const mergedChapters = mergeLatest(activeChapters, remoteChapters);
       const remoteSceneMap = new Map(remoteScenes.map(s => [s.id, s]));
       const mergedScenes = new Map<string, Scene>();
-      const conflictCopies: Scene[] = [];
       for (const local of activeScenes) {
         const remote = remoteSceneMap.get(local.id);
         if (!remote) {
@@ -538,16 +521,11 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
         const lastSynced = local.lastSyncedRevision || 0;
         const differs = remote.content !== local.content || remote.title !== local.title || remote.order !== local.order;
         const localChanged = differs && local.revision > lastSynced;
-        const remoteChanged = differs && remote.revision > lastSynced;
-        if (localChanged && remoteChanged) {
-          conflictCopies.push({ ...local, id:uid(), title:`${local.title}（別端末の編集も保存）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
-          mergedScenes.set(remote.id, remote);
-        } else if (localChanged) {
+        if (localChanged) {
           const result = await saveSceneToCloud(local, remote.revision);
           if (result.status === "saved") {
             mergedScenes.set(local.id, { ...local, updatedAt:result.updatedAt,revision:result.revision,lastSyncedRevision:result.revision,deviceId:result.deviceId,syncStatus:"saved" });
           } else {
-            conflictCopies.push({ ...local, id:uid(), title:`${local.title}（別端末の編集も保存）`, createdAt:now(), updatedAt:now(), revision:1, syncStatus:"conflict", lastSyncedRevision:0, deviceId });
             mergedScenes.set(remote.id, remote);
           }
         } else {
@@ -566,7 +544,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
         return;
       }
 
-      for (const scene of [...mergedScenes.values(), ...conflictCopies]) {
+      for (const scene of mergedScenes.values()) {
         if (remoteScenes.some(remote => remote.id === scene.id)) continue;
         const result = await saveSceneToCloud(scene, 0);
         if (result.status === "saved") {
@@ -575,42 +553,14 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
           mergedScenes.set(scene.id, { ...scene, syncStatus:"error" });
         }
       }
-      conflictCopies.forEach(copy => {
-        if (!mergedScenes.has(copy.id)) mergedScenes.set(copy.id, copy);
-      });
       const savedScenes = [...mergedScenes.values()];
       await Promise.all([...mergedWorks.map(x=>put("works",x)),...mergedChapters.map(x=>put("chapters",x)),...savedScenes.map(x=>put("scenes",x))]);
       setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes);
-      setCloudMessage(conflictCopies.length ? `同期しました。競合コピーを${conflictCopies.length}件保存しました。` : "PC・スマホの内容を同期しました。");
+      setCloudMessage("保存・同期しました。もう一方の端末でも「保存・同期する」を押すと、この内容を受信します。");
     } finally {
       syncRunning.current = false;
-      if (syncQueued.current) {
-        syncQueued.current = false;
-        window.setTimeout(() => syncAllRef.current(), 0);
-      }
     }
-  }, [supabase, user, works, chapters, scenes, saveSceneToCloud]);
-  useEffect(() => {
-    syncAllRef.current = syncAll;
-  }, [syncAll]);
-
-  useEffect(() => {
-    if (!user || !ready) return;
-    syncAllRef.current();
-    const onOnline = () => syncAllRef.current();
-    const onFocus = () => syncAllRef.current();
-    const onVisibility = () => { if (document.visibilityState === "visible") syncAllRef.current(); };
-    window.addEventListener("online", onOnline);
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibility);
-    const timer = window.setInterval(() => syncAllRef.current(), 5_000);
-    return () => {
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.clearInterval(timer);
-    };
-  }, [user?.id, ready]);
+  }, [supabase, user, saveSceneToCloud]);
 
   const historyModal = historyOpen && <div className="modalBackdrop"><section className="modal">
     <button className="modalClose" onClick={()=>setHistoryOpen(false)}>×</button>
@@ -628,11 +578,11 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
 
   if (!ready) return <div className="loading">書斎を整えています…</div>;
   if (locked) return <div className="lock"><div className="lockMark"><img src="./icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
-  if (focus && currentScene) return <><div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)} onHistory={openHistory}/></div>{historyModal}</>;
-  if (currentScene) return <><Editor scene={currentScene} workCount={workCount} onCommit={commit} onBack={()=>setSceneId(null)} onFocus={setFocus} onHistory={openHistory}/>{historyModal}</>;
+  if (focus && currentScene) return <><div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onSync={syncAll} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)} onHistory={openHistory}/></div>{historyModal}</>;
+  if (currentScene) return <><Editor scene={currentScene} workCount={workCount} onCommit={commit} onSync={syncAll} onBack={()=>setSceneId(null)} onFocus={setFocus} onHistory={openHistory}/>{historyModal}</>;
 
   return <div className="appShell">
-    <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><img src="./icon.png" alt="" /> 小説執筆</button><nav><button onClick={()=>setMenu("account")}>同期</button><button onClick={()=>setMenu("backup")}>保存</button><button onClick={()=>setMenu("settings")}>設定</button>{signOutPath && <a className="signOut" href={signOutPath}>ログアウト</a>}</nav></header>
+    <header className="topbar"><button className="brand" onClick={()=>{setWorkId(null);setSceneId(null)}}><img src="./icon.png" alt="" /> 小説執筆</button><nav><button className="headerSyncButton" onClick={syncAll}>保存・同期する</button><button onClick={()=>setMenu("account")}>同期設定</button><button onClick={()=>setMenu("backup")}>バックアップ</button><button onClick={()=>setMenu("settings")}>設定</button>{signOutPath && <a className="signOut" href={signOutPath}>ログアウト</a>}</nav></header>
     {!currentWork ? <main className="library">
       <div className="pageIntro"><div><p className="eyebrow">MY MANUSCRIPTS</p><h1>作品</h1><p>端末に保存済み。オフラインでも執筆できます。</p></div><button className="primary" onClick={createWork}>＋ 新しい作品</button></div>
       <div className="workGrid">{sortedWorks.map(w=><article className="workCard" key={w.id} onClick={()=>chooseWork(w.id)}><div className="bookEdge"/><div><small>{fmt(w.updatedAt)} 更新</small><h2>{w.title}</h2><p>{scenes.filter(s=>s.workId===w.id).reduce((n,s)=>n+count(s.content),0).toLocaleString()}字</p></div><div className="cardActions"><button onClick={e=>{e.stopPropagation();rename("work",w.id,w.title)}}>名前変更</button><button onClick={e=>{e.stopPropagation();deleteItem("work",w.id)}}>削除</button></div></article>)}</div>
@@ -648,7 +598,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     {menu!=="none" && <div className="modalBackdrop" onMouseDown={()=>setMenu("none")}><section className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modalClose" onClick={()=>setMenu("none")}>×</button>
       {menu==="settings" && <><p className="eyebrow">PREFERENCES</p><h2>執筆設定</h2><label>表示テーマ<select value={settings.theme} onChange={e=>setSettings({...settings,theme:e.target.value as Settings["theme"]})}><option value="system">端末に合わせる</option><option value="light">ライト</option><option value="dark">ダーク</option></select></label><label>文字サイズ <b>{settings.fontSize}px</b><input type="range" min="15" max="24" value={settings.fontSize} onChange={e=>setSettings({...settings,fontSize:+e.target.value})}/></label><label>行間 <b>{settings.lineHeight}</b><input type="range" min="1.5" max="2.4" step=".1" value={settings.lineHeight} onChange={e=>setSettings({...settings,lineHeight:+e.target.value})}/></label><label>本文幅 <b>{settings.width}px</b><input type="range" min="560" max="980" step="20" value={settings.width} onChange={e=>setSettings({...settings,width:+e.target.value})}/></label><label>自動ロック<select value={settings.lockMinutes} onChange={e=>setSettings({...settings,lockMinutes:e.target.value})}><option value="1">1分</option><option value="5">5分</option><option value="15">15分</option><option value="30">30分</option><option value="close">アプリを閉じたときのみ</option></select></label><button className="primary wide" onClick={()=>{setPinMode("setup");setPin("");}}>PINを設定・変更</button>{pinMode==="setup"&&<div className="pinSetup"><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} type="password" inputMode="numeric" placeholder="4〜6桁"/><button onClick={submitPin}>設定</button><span>{pinError}</span></div>}</>}
       {menu==="backup" && <><p className="eyebrow">BACKUP</p><h2>原稿を守る</h2><p className="modalCopy">バックアップには認証情報やPINは含まれません。</p><button className="primary wide" onClick={backup}>JSONバックアップを保存</button><button className="secondary wide" onClick={exportTxt} disabled={!currentWork}>現在の作品をTXT保存</button><button className="secondary wide" onClick={()=>fileRef.current?.click()}>JSONから復元</button><input ref={fileRef} hidden type="file" accept=".json,application/json" onChange={e=>e.target.files?.[0]&&restore(e.target.files[0])}/></>}
-      {menu==="account" && <><p className="eyebrow">CLOUD SYNC</p><h2>クラウド同期</h2><div className="syncState"><span>●</span><div><b>{user ? `${user.email} で同期中` : `${accountEmail}で利用中`}</b><p>{signOutPath ? "ログアウト後は、再認証するまで作品名や本文は表示されません。" : "原稿はこのブラウザのIndexedDBに保存され、GitHubには送信されません。"}</p></div></div>{user ? <><button className="primary wide" onClick={syncAll}>今すぐすべて同期</button><button className="secondary wide" onClick={()=>supabase?.auth.signOut()}>Supabase同期を解除</button></> : <><label>同期用メールアドレス<input value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="you@example.com"/></label><label>同期用パスワード<input value={password} onChange={e=>setPassword(e.target.value)} type="password" minLength={8}/></label><button className="primary wide" onClick={()=>signIn(false)}>Supabase同期に接続</button><button className="secondary wide" onClick={()=>signIn(true)}>同期アカウントを新規登録</button></>}{signOutPath && <a className="secondary wide modalSignOut" href={signOutPath}>アプリからログアウト</a>}<p className="finePrint">{cloudMessage || (supabase ? "同期は入力停止から約2秒後に行われます。" : "端末間同期はSupabase設定後に利用できます。")}</p></>}
+      {menu==="account" && <><p className="eyebrow">CLOUD SYNC</p><h2>クラウド同期</h2><div className="syncState"><span>●</span><div><b>{user ? `${user.email} で同期できます` : `${accountEmail}で利用中`}</b><p>執筆中はこの端末だけに保存します。「保存・同期する」を押した時だけ、PC・スマホ間で送受信します。</p></div></div>{user ? <><button className="primary wide" onClick={syncAll}>保存・同期する</button><button className="secondary wide" onClick={()=>supabase?.auth.signOut()}>Supabase同期を解除</button></> : <><label>同期用メールアドレス<input value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="you@example.com"/></label><label>同期用パスワード<input value={password} onChange={e=>setPassword(e.target.value)} type="password" minLength={8}/></label><button className="primary wide" onClick={()=>signIn(false)}>Supabase同期に接続</button><button className="secondary wide" onClick={()=>signIn(true)}>同期アカウントを新規登録</button></>}{signOutPath && <a className="secondary wide modalSignOut" href={signOutPath}>アプリからログアウト</a>}<p className="finePrint">{cloudMessage || (supabase ? "自動同期はしません。本文は入力中も端末内に自動保存されます。" : "端末間同期はSupabase設定後に利用できます。")}</p></>}
     </section></div>}
   </div>;
 }
