@@ -19,6 +19,10 @@ const DEFAULT_SETTINGS: Settings = { theme: "system", fontSize: 18, lineHeight: 
 const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 const count = (text: string) => Array.from(text).length;
+const normalizePin = (value: string) => value
+  .replace(/[０-９]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xfee0))
+  .replace(/\D/g, "")
+  .slice(0, 6);
 const fmt = (iso: string) => new Intl.DateTimeFormat("ja-JP", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
 
 function openDb(): Promise<IDBDatabase> {
@@ -217,8 +221,16 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       const lastScene = localStorage.getItem("lastSceneId");
       if (settings.reopen && w.some(x => x.id === lastWork)) setWorkId(lastWork);
       if (settings.reopen && s.some(x => x.id === lastScene)) setSceneId(lastScene);
-      const hasPin = Boolean(localStorage.getItem("pinHash"));
-      setLocked(hasPin); setPinMode(hasPin ? "unlock" : "none"); setReady(true);
+      const savedPinHash = localStorage.getItem("pinHash");
+      const savedPinSalt = localStorage.getItem("pinSalt");
+      const hasCompletePin = Boolean(savedPinHash && savedPinSalt);
+      if (!hasCompletePin) {
+        localStorage.removeItem("pinHash");
+        localStorage.removeItem("pinSalt");
+      }
+      setLocked(true);
+      setPinMode(hasCompletePin ? "unlock" : "setup");
+      setReady(true);
     })().catch(() => setReady(true));
     navigator.serviceWorker?.register("./sw.js");
   }, []);
@@ -244,6 +256,25 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     arm();
     return () => { clearTimeout(timer); ["pointerdown", "keydown", "touchstart"].forEach(e => window.removeEventListener(e, arm)); };
   }, [locked, settings.lockMinutes]);
+  useEffect(() => {
+    const lockWhenHidden = () => {
+      if (document.visibilityState !== "hidden") return;
+      const hasCompletePin = Boolean(localStorage.getItem("pinHash") && localStorage.getItem("pinSalt"));
+      setSceneId(null);
+      setWorkId(null);
+      setPin("");
+      setPinError("");
+      setPinMode(hasCompletePin ? "unlock" : "setup");
+      setLocked(true);
+    };
+    const lockOnPageHide = () => lockWhenHidden();
+    document.addEventListener("visibilitychange", lockWhenHidden);
+    window.addEventListener("pagehide", lockOnPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", lockWhenHidden);
+      window.removeEventListener("pagehide", lockOnPageHide);
+    };
+  }, []);
   useEffect(() => {
     const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setFocus(false); };
     window.addEventListener("keydown", esc); return () => window.removeEventListener("keydown", esc);
@@ -406,13 +437,24 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     } catch { alert("復元できませんでした。既存の原稿は変更されていません。"); }
   };
   const submitPin = async () => {
-    if (!/^\d{4,6}$/.test(pin)) { setPinError("4〜6桁の数字を入力してください"); return; }
+    const normalizedPin = normalizePin(pin);
+    if (!/^\d{4,6}$/.test(normalizedPin)) { setPinError("4〜6桁の数字を入力してください"); return; }
     if (pinMode === "setup") {
-      const salt = uid(); localStorage.setItem("pinSalt", salt); localStorage.setItem("pinHash", await pinDigest(pin, salt)); setPinMode("none"); setLocked(false); setPin(""); return;
+      const salt = uid(); localStorage.setItem("pinSalt", salt); localStorage.setItem("pinHash", await pinDigest(normalizedPin, salt)); setPinMode("none"); setLocked(false); setPin(""); setPinError(""); return;
     }
-    const salt = localStorage.getItem("pinSalt") || ""; if (await pinDigest(pin, salt) === localStorage.getItem("pinHash")) { setLocked(false); setPinMode("none"); setPin(""); setPinError(""); } else setPinError("PINが違います");
+    const salt = localStorage.getItem("pinSalt");
+    const hash = localStorage.getItem("pinHash");
+    if (!salt || !hash) {
+      localStorage.removeItem("pinHash");
+      localStorage.removeItem("pinSalt");
+      setPin("");
+      setPinMode("setup");
+      setPinError("PIN情報を修復します。新しいPINを設定してください。");
+      return;
+    }
+    if (await pinDigest(normalizedPin, salt) === hash) { setLocked(false); setPinMode("none"); setPin(""); setPinError(""); } else setPinError("PINを確認できません。下の「PINを再設定」から直せます。");
   };
-  const resetPin = () => { if (confirm("PINだけをリセットします。作品データは消えません。")) { localStorage.removeItem("pinHash"); localStorage.removeItem("pinSalt"); setLocked(false); setPinMode("none"); } };
+  const resetPin = () => { if (confirm("PINだけを再設定します。作品データは消えません。")) { localStorage.removeItem("pinHash"); localStorage.removeItem("pinSalt"); setPin(""); setPinError(""); setLocked(true); setPinMode("setup"); } };
   const signIn = async (register = false) => {
     if (!supabase) { setCloudMessage("Supabaseの接続情報が未設定です。"); return; }
     setCloudMessage("接続中…");
@@ -577,7 +619,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   </section></div>;
 
   if (!ready) return <div className="loading">書斎を整えています…</div>;
-  if (locked) return <div className="lock"><div className="lockMark"><img src="./icon.png" alt="万年筆" /></div><h1>ロック中</h1><p>作品名や本文は表示されていません</p><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="PIN" autoFocus/><button onClick={submitPin}>ロックを解除</button><button className="textButton" onClick={resetPin}>PINを忘れた場合</button><span className="error">{pinError}</span></div>;
+  if (locked) return <div className="lock"><div className="lockMark"><img src="./icon.png" alt="万年筆" /></div><h1>{pinMode === "setup" ? "PINを設定" : "ロック中"}</h1><p>{pinMode === "setup" ? "この端末で使う4〜6桁のPINを決めてください" : "作品名や本文は表示されていません"}</p><input value={pin} onChange={e=>{setPin(normalizePin(e.target.value));setPinError("");}} onKeyDown={e=>e.key==="Enter"&&submitPin()} inputMode="numeric" type="password" placeholder="4〜6桁のPIN" autoFocus/><button onClick={submitPin}>{pinMode === "setup" ? "PINを設定して開く" : "ロックを解除"}</button>{pinMode !== "setup" && <button className="textButton" onClick={resetPin}>PINを再設定</button>}<span className="error">{pinError}</span></div>;
   if (focus && currentScene) return <><div className="focusMode"><Editor scene={currentScene} workCount={workCount} onCommit={commit} onSync={syncAll} onBack={()=>setFocus(false)} onFocus={()=>setFocus(false)} onHistory={openHistory}/></div>{historyModal}</>;
   if (currentScene) return <><Editor scene={currentScene} workCount={workCount} onCommit={commit} onSync={syncAll} onBack={()=>setSceneId(null)} onFocus={setFocus} onHistory={openHistory}/>{historyModal}</>;
 
