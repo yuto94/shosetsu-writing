@@ -18,7 +18,7 @@ const STORE_NAMES = [...CONTENT_STORE_NAMES, "tombstones"] as const;
 const DEFAULT_SETTINGS: Settings = { theme: "system", fontSize: 18, lineHeight: 1.9, width: 760, lockMinutes: "5", reopen: true, showStatus: true };
 const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
-const count = (text: string) => Array.from(text).length;
+const count = (text: string) => Array.from(text).filter(character => !/\s/u.test(character)).length;
 const normalizePin = (value: string) => value
   .replace(/[０-９]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xfee0))
   .replace(/\D/g, "")
