@@ -7,18 +7,21 @@ type Work = { id: string; userId: string; title: string; createdAt: string; upda
 type Chapter = { id: string; workId: string; userId: string; title: string; order: number; createdAt: string; updatedAt: string; revision: number };
 type SyncStatus = "saved" | "saving" | "offline" | "error" | "conflict";
 type Scene = { id: string; workId: string; chapterId: string; userId: string; title: string; content: string; order: number; createdAt: string; updatedAt: string; revision: number; syncStatus: SyncStatus; lastSyncedRevision?: number; deviceId?: string };
-type Tombstone = { id: string; itemId: string; itemType: "work" | "chapter" | "scene"; userId: string; deletedAt: string; deviceId?: string };
+type CharacterImage = { id: string; workId: string; userId: string; name: string; mimeType: string; blob: Blob; storagePath?: string; createdAt: string; updatedAt: string };
+type Tombstone = { id: string; itemId: string; itemType: "work" | "chapter" | "scene" | "image"; userId: string; deletedAt: string; deviceId?: string };
 type SceneVersion = { id: number; content: string; revision: number; savedAt: string };
 type Settings = { theme: "system" | "light" | "dark"; fontSize: number; lineHeight: number; width: number; lockMinutes: string; reopen: boolean; showStatus: boolean };
-type Snapshot = { version: 1; exportedAt: string; works: Work[]; chapters: Chapter[]; scenes: Scene[]; settings: Settings };
+type BackupImage = Omit<CharacterImage, "blob"> & { dataUrl: string };
+type Snapshot = { version: 1 | 2; exportedAt: string; works: Work[]; chapters: Chapter[]; scenes: Scene[]; images?: BackupImage[]; settings: Settings };
 
 const DB_NAME = "shizuku-writer";
-const CONTENT_STORE_NAMES = ["works", "chapters", "scenes"] as const;
+const CONTENT_STORE_NAMES = ["works", "chapters", "scenes", "images"] as const;
 const STORE_NAMES = [...CONTENT_STORE_NAMES, "tombstones"] as const;
 const DEFAULT_SETTINGS: Settings = { theme: "system", fontSize: 18, lineHeight: 1.9, width: 760, lockMinutes: "5", reopen: true, showStatus: true };
 const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 const count = (text: string) => Array.from(text).filter(character => !/\s/u.test(character)).length;
+const imageExtension = (mimeType: string) => ({ "image/jpeg":"jpg", "image/png":"png", "image/webp":"webp", "image/gif":"gif" }[mimeType] || "img");
 const normalizePin = (value: string) => value
   .replace(/[０-９]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xfee0))
   .replace(/\D/g, "")
@@ -27,7 +30,7 @@ const fmt = (iso: string) => new Intl.DateTimeFormat("ja-JP", { month: "short", 
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+    const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       STORE_NAMES.forEach((name) => {
@@ -77,10 +80,24 @@ function download(name: string, text: string, type: string) {
   a.click();
   URL.revokeObjectURL(a.href);
 }
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
 async function pinDigest(pin: string, salt: string) {
   const bytes = new TextEncoder().encode(`${salt}:${pin}`);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function CharacterVisual({ image, onDelete }: { image: CharacterImage; onDelete: () => void }) {
+  const source = useMemo(() => URL.createObjectURL(image.blob), [image.blob]);
+  useEffect(() => () => URL.revokeObjectURL(source), [source]);
+  return <figure className="characterVisual"><img src={source} alt={image.name}/><figcaption><span>{image.name}</span><button onClick={onDelete}>削除</button></figcaption></figure>;
 }
 
 function Editor({ scene, workCount, onCommit, onSync, onBack, onFocus, onHistory }: { scene: Scene; workCount: number; onCommit: (content: string, status: SyncStatus) => Promise<void>; onSync: () => Promise<void>; onBack: () => void; onFocus: (value: boolean) => void; onHistory: () => void }) {
@@ -176,6 +193,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   const [works, setWorks] = useState<Work[]>([]);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const [characterImages, setCharacterImages] = useState<CharacterImage[]>([]);
   const [workId, setWorkId] = useState<string | null>(null);
   const [sceneId, setSceneId] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
@@ -196,6 +214,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem("writerSettings") || "{}") }; } catch { return DEFAULT_SETTINGS; }
   });
   const fileRef = useRef<HTMLInputElement>(null);
+  const imageFileRef = useRef<HTMLInputElement>(null);
   const syncRunning = useRef(false);
   const supabase = useMemo(() => {
     const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
@@ -207,7 +226,8 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
 
   useEffect(() => {
     (async () => {
-      let [w, c, s] = await Promise.all([getAll<Work>("works"), getAll<Chapter>("chapters"), getAll<Scene>("scenes")]);
+      const [w0, c0, s0, storedImages] = await Promise.all([getAll<Work>("works"), getAll<Chapter>("chapters"), getAll<Scene>("scenes"), getAll<CharacterImage>("images")]);
+      let w = w0, c = c0, s = s0;
       if (!w.length && !localStorage.getItem("writerInitialized")) {
         const t = now(), wid = uid(), cid = uid(), sid = uid();
         w = [{ id: wid, userId: "local", title: "夜の森で、あなたを待つ", createdAt: t, updatedAt: t, revision: 1 }];
@@ -216,7 +236,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
         await Promise.all([put("works", w[0]), put("chapters", c[0]), put("scenes", s[0])]);
       }
       localStorage.setItem("writerInitialized", "1");
-      setWorks(w); setChapters(c); setScenes(s);
+      setWorks(w); setChapters(c); setScenes(s); setCharacterImages(storedImages);
       const lastWork = localStorage.getItem("lastWorkId");
       const lastScene = localStorage.getItem("lastSceneId");
       if (settings.reopen && w.some(x => x.id === lastWork)) setWorkId(lastWork);
@@ -394,6 +414,34 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     };
     await put("tombstones", tombstone);
   };
+  const addCharacterImages = async (files: FileList | null) => {
+    if (!workId || !files?.length) return;
+    const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+    const accepted = [...files].filter(file => allowedTypes.has(file.type) && file.size <= 10 * 1024 * 1024);
+    if (!accepted.length) {
+      alert("JPEG・PNG・WebP・GIFの画像を選んでください（1枚10MBまで）。");
+      return;
+    }
+    const added: CharacterImage[] = accepted.map(file => ({
+      id: uid(),
+      workId,
+      userId: user?.id || "local",
+      name: file.name.replace(/\.[^.]+$/, "") || "キャラクター",
+      mimeType: file.type,
+      blob: file,
+      createdAt: now(),
+      updatedAt: now(),
+    }));
+    await Promise.all(added.map(image => put("images", image)));
+    setCharacterImages(current => [...current, ...added]);
+    if (imageFileRef.current) imageFileRef.current.value = "";
+  };
+  const deleteCharacterImage = async (image: CharacterImage) => {
+    if (!confirm(`「${image.name}」の画像を削除しますか？`)) return;
+    await recordDeletion("image", image.id);
+    await remove("images", image.id);
+    setCharacterImages(current => current.filter(item => item.id !== image.id));
+  };
   const deleteItem = async (kind: "work" | "chapter" | "scene", id: string) => {
     if (!confirm("削除しますか？ この操作は元に戻せません。")) return;
     await recordDeletion(kind, id);
@@ -403,8 +451,8 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       setScenes(v => v.filter(x => x.chapterId !== id)); setChapters(v => v.filter(x => x.id !== id));
     }
     if (kind === "work") {
-      await Promise.all(scenes.filter(x => x.workId === id).map(x => remove("scenes", x.id))); await Promise.all(chapters.filter(x => x.workId === id).map(x => remove("chapters", x.id))); await remove("works", id);
-      setWorks(v => v.filter(x => x.id !== id)); setChapters(v => v.filter(x => x.workId !== id)); setScenes(v => v.filter(x => x.workId !== id)); setWorkId(null);
+      await Promise.all(scenes.filter(x => x.workId === id).map(x => remove("scenes", x.id))); await Promise.all(chapters.filter(x => x.workId === id).map(x => remove("chapters", x.id))); await Promise.all(characterImages.filter(x => x.workId === id).map(x => remove("images", x.id))); await remove("works", id);
+      setWorks(v => v.filter(x => x.id !== id)); setChapters(v => v.filter(x => x.workId !== id)); setScenes(v => v.filter(x => x.workId !== id)); setCharacterImages(v => v.filter(x => x.workId !== id)); setWorkId(null);
     }
   };
   const moveScene = async (scene: Scene, dir: -1 | 1) => {
@@ -413,7 +461,13 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
   };
   const chooseScene = (s: Scene) => { setSceneId(s.id); localStorage.setItem("lastSceneId", s.id); };
   const chooseWork = (id: string) => { setWorkId(id); localStorage.setItem("lastWorkId", id); };
-  const backup = () => download(`shizuku-backup-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify({ version: 1, exportedAt: now(), works, chapters, scenes, settings }, null, 2), "application/json;charset=utf-8");
+  const backup = async () => {
+    const images = await Promise.all(characterImages.map(async image => {
+      const { blob, ...metadata } = image;
+      return { ...metadata, dataUrl:await blobToDataUrl(blob) };
+    }));
+    download(`shizuku-backup-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify({ version:2,exportedAt:now(),works,chapters,scenes,images,settings }, null, 2), "application/json;charset=utf-8");
+  };
   const exportTxt = () => {
     if (!currentWork) return; let text = `${currentWork.title}\n\n`;
     chapters.filter(c => c.workId === currentWork.id).sort((a,b)=>a.order-b.order).forEach(c => { text += `■ ${c.title}\n\n`; scenes.filter(s => s.chapterId === c.id).sort((a,b)=>a.order-b.order).forEach(s => { text += `【${s.title}】\n${s.content}\n\n`; }); });
@@ -423,17 +477,21 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     try {
       const data = JSON.parse(await file.text()) as Snapshot;
       if (!Array.isArray(data.works) || !Array.isArray(data.chapters) || !Array.isArray(data.scenes)) throw new Error();
-      backup();
+      await backup();
       const replace = confirm("「OK」で全置換、「キャンセル」で追加インポートします。");
       if (replace) await Promise.all(CONTENT_STORE_NAMES.map(clearStore));
-      const existing = new Set([...works, ...chapters, ...scenes].map(x => x.id));
+      const existing = new Set([...works, ...chapters, ...scenes, ...characterImages].map(x => x.id));
       const map = new Map<string,string>();
       const remap = (id: string) => { if (!existing.has(id)) return id; if (!map.has(id)) map.set(id, uid()); return map.get(id)!; };
       const ws = data.works.map(x => ({ ...x, id: remap(x.id) }));
       const cs = data.chapters.map(x => ({ ...x, id: remap(x.id), workId: remap(x.workId) }));
       const ss = data.scenes.map(x => ({ ...x, id: remap(x.id), workId: remap(x.workId), chapterId: remap(x.chapterId) }));
-      await Promise.all([...ws.map(x=>put("works",x)), ...cs.map(x=>put("chapters",x)), ...ss.map(x=>put("scenes",x))]);
-      setWorks(replace ? ws : [...works, ...ws]); setChapters(replace ? cs : [...chapters, ...cs]); setScenes(replace ? ss : [...scenes, ...ss]); alert("復元しました。");
+      const restoredImages: CharacterImage[] = await Promise.all((data.images || []).map(async image => {
+        const { dataUrl, ...metadata } = image;
+        return { ...metadata, id:remap(image.id), workId:remap(image.workId), blob:await (await fetch(dataUrl)).blob() };
+      }));
+      await Promise.all([...ws.map(x=>put("works",x)), ...cs.map(x=>put("chapters",x)), ...ss.map(x=>put("scenes",x)), ...restoredImages.map(x=>put("images",x))]);
+      setWorks(replace ? ws : [...works, ...ws]); setChapters(replace ? cs : [...chapters, ...cs]); setScenes(replace ? ss : [...scenes, ...ss]); setCharacterImages(replace ? restoredImages : [...characterImages, ...restoredImages]); alert("復元しました。");
     } catch { alert("復元できませんでした。既存の原稿は変更されていません。"); }
   };
   const submitPin = async () => {
@@ -476,19 +534,21 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     setCloudMessage("同期中…");
     try {
       const deviceId = localStorage.getItem("deviceId") || uid(); localStorage.setItem("deviceId", deviceId);
-      const [localWorks, localChapters, localScenes, localTombstones] = await Promise.all([
+      const [localWorks, localChapters, localScenes, localImages, localTombstones] = await Promise.all([
         getAll<Work>("works"),
         getAll<Chapter>("chapters"),
         getAll<Scene>("scenes"),
+        getAll<CharacterImage>("images"),
         getAll<Tombstone>("tombstones"),
       ]);
-      const [rw, rc, rs, rt] = await Promise.all([
+      const [rw, rc, rs, ri, rt] = await Promise.all([
         supabase.from("works").select("*").eq("user_id", user.id),
         supabase.from("chapters").select("*").eq("user_id", user.id),
         supabase.from("scenes").select("*").eq("user_id", user.id),
+        supabase.from("character_images").select("*").eq("user_id", user.id),
         supabase.from("deletion_tombstones").select("*").eq("user_id", user.id),
       ]);
-      if (rw.error || rc.error || rs.error || rt.error) {
+      if (rw.error || rc.error || rs.error || ri.error || rt.error) {
         setCloudMessage("受信できませんでした。原稿は端末内に残っています。");
         return;
       }
@@ -510,14 +570,17 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       const deletedWorks = new Set(tombstones.filter(t => t.itemType === "work").map(t => t.itemId));
       const deletedChapters = new Set(tombstones.filter(t => t.itemType === "chapter").map(t => t.itemId));
       const deletedScenes = new Set(tombstones.filter(t => t.itemType === "scene").map(t => t.itemId));
+      const deletedImages = new Set(tombstones.filter(t => t.itemType === "image").map(t => t.itemId));
 
       const activeWorks = localWorks.filter(w => !deletedWorks.has(w.id));
       const activeChapters = localChapters.filter(c => !deletedWorks.has(c.workId) && !deletedChapters.has(c.id));
       const activeScenes = localScenes.filter(s => !deletedWorks.has(s.workId) && !deletedChapters.has(s.chapterId) && !deletedScenes.has(s.id));
+      const activeImages = localImages.filter(image => !deletedWorks.has(image.workId) && !deletedImages.has(image.id));
       await Promise.all([
         ...localWorks.filter(w => deletedWorks.has(w.id)).map(w => remove("works", w.id)),
         ...localChapters.filter(c => deletedWorks.has(c.workId) || deletedChapters.has(c.id)).map(c => remove("chapters", c.id)),
         ...localScenes.filter(s => deletedWorks.has(s.workId) || deletedChapters.has(s.chapterId) || deletedScenes.has(s.id)).map(s => remove("scenes", s.id)),
+        ...localImages.filter(image => deletedWorks.has(image.workId) || deletedImages.has(image.id)).map(image => remove("images", image.id)),
         ...tombstones.map(t => put("tombstones", t)),
       ]);
 
@@ -536,11 +599,17 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
         await Promise.all(tombstones.filter(t => t.itemType === "scene").map(t => supabase.from("scenes").delete().eq("id", t.itemId).eq("user_id", user.id)));
         await Promise.all(tombstones.filter(t => t.itemType === "chapter").map(t => supabase.from("chapters").delete().eq("id", t.itemId).eq("user_id", user.id)));
         await Promise.all(tombstones.filter(t => t.itemType === "work").map(t => supabase.from("works").delete().eq("id", t.itemId).eq("user_id", user.id)));
+        const imageRowsToDelete = (ri.data || []).filter(row => deletedWorks.has(row.work_id) || deletedImages.has(row.id));
+        if (imageRowsToDelete.length) {
+          await supabase.storage.from("character-visuals").remove(imageRowsToDelete.map(row => row.storage_path));
+          await supabase.from("character_images").delete().in("id", imageRowsToDelete.map(row => row.id)).eq("user_id", user.id);
+        }
       }
 
       const remoteWorks: Work[] = (rw.data || []).filter(x => !deletedWorks.has(x.id)).map(x => ({ id:x.id,userId:x.user_id,title:x.title,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
       const remoteChapters: Chapter[] = (rc.data || []).filter(x => !deletedWorks.has(x.work_id) && !deletedChapters.has(x.id)).map(x => ({ id:x.id,workId:x.work_id,userId:x.user_id,title:x.title,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision }));
       const remoteScenes: Scene[] = (rs.data || []).filter(x => !deletedWorks.has(x.work_id) && !deletedChapters.has(x.chapter_id) && !deletedScenes.has(x.id)).map(x => ({ id:x.id,workId:x.work_id,chapterId:x.chapter_id,userId:x.user_id,title:x.title,content:x.content,order:x.order,createdAt:x.created_at,updatedAt:x.updated_at,revision:x.revision,syncStatus:"saved",lastSyncedRevision:x.revision,deviceId:x.device_id }));
+      const remoteImageRows = (ri.data || []).filter(x => !deletedWorks.has(x.work_id) && !deletedImages.has(x.id));
 
       const mergeLatest = <T extends { id:string; updatedAt:string }>(local:T[], remote:T[]) => {
         const merged = new Map(local.map(x => [x.id, x]));
@@ -597,8 +666,43 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
       }
       const savedScenes = [...mergedScenes.values()];
       await Promise.all([...mergedWorks.map(x=>put("works",x)),...mergedChapters.map(x=>put("chapters",x)),...savedScenes.map(x=>put("scenes",x))]);
-      setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes);
-      setCloudMessage("保存・同期しました。もう一方の端末でも「保存・同期する」を押すと、この内容を受信します。");
+      const remoteImageMap = new Map(remoteImageRows.map(row => [row.id, row]));
+      const mergedImages = new Map<string, CharacterImage>();
+      let imageSyncFailed = false;
+      for (const localImage of activeImages) {
+        const remoteImage = remoteImageMap.get(localImage.id);
+        if (!remoteImage || localImage.updatedAt > remoteImage.updated_at) {
+          const storagePath = remoteImage?.storage_path || `${user.id}/${localImage.workId}/${localImage.id}.${imageExtension(localImage.mimeType)}`;
+          const upload = await supabase.storage.from("character-visuals").upload(storagePath, localImage.blob, { contentType:localImage.mimeType, upsert:true });
+          if (upload.error) {
+            imageSyncFailed = true;
+            mergedImages.set(localImage.id, localImage);
+          } else {
+            const syncedImage = { ...localImage, userId:user.id, storagePath };
+            const metadata = await supabase.from("character_images").upsert({ id:syncedImage.id,work_id:syncedImage.workId,user_id:user.id,name:syncedImage.name,storage_path:storagePath,mime_type:syncedImage.mimeType,created_at:syncedImage.createdAt,updated_at:syncedImage.updatedAt });
+            if (metadata.error) imageSyncFailed = true;
+            mergedImages.set(syncedImage.id, syncedImage);
+          }
+        } else {
+          const downloaded = await supabase.storage.from("character-visuals").download(remoteImage.storage_path);
+          if (downloaded.error || !downloaded.data) {
+            imageSyncFailed = true;
+            mergedImages.set(localImage.id, localImage);
+          } else {
+            mergedImages.set(remoteImage.id, { id:remoteImage.id,workId:remoteImage.work_id,userId:remoteImage.user_id,name:remoteImage.name,mimeType:remoteImage.mime_type,blob:downloaded.data,storagePath:remoteImage.storage_path,createdAt:remoteImage.created_at,updatedAt:remoteImage.updated_at });
+          }
+        }
+        remoteImageMap.delete(localImage.id);
+      }
+      for (const remoteImage of remoteImageMap.values()) {
+        const downloaded = await supabase.storage.from("character-visuals").download(remoteImage.storage_path);
+        if (downloaded.error || !downloaded.data) { imageSyncFailed = true; continue; }
+        mergedImages.set(remoteImage.id, { id:remoteImage.id,workId:remoteImage.work_id,userId:remoteImage.user_id,name:remoteImage.name,mimeType:remoteImage.mime_type,blob:downloaded.data,storagePath:remoteImage.storage_path,createdAt:remoteImage.created_at,updatedAt:remoteImage.updated_at });
+      }
+      const savedImages = [...mergedImages.values()];
+      await Promise.all(savedImages.map(image => put("images", image)));
+      setWorks(mergedWorks); setChapters(mergedChapters); setScenes(savedScenes); setCharacterImages(savedImages);
+      setCloudMessage(imageSyncFailed ? "本文は同期しました。同期できなかった画像は端末内に残っています。" : "本文と画像を保存・同期しました。もう一方の端末でも「保存・同期する」を押すと受信します。");
     } finally {
       syncRunning.current = false;
     }
@@ -631,6 +735,12 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     </main> : <main className="chaptersPage">
       <button className="backLink" onClick={()=>setWorkId(null)}>← 作品一覧</button>
       <div className="workTitle"><div><p className="eyebrow">MANUSCRIPT</p><h1>{currentWork.title}</h1><p>全 {workCount.toLocaleString()}字</p></div><button className="secondary" onClick={createChapter}>＋ 章を追加</button></div>
+      <section className="characterVisualsSection">
+        <div className="characterVisualsHeader"><div><p className="eyebrow">CHARACTER VISUALS</p><h2>キャラクタービジュアル</h2></div><button className="secondary" onClick={()=>imageFileRef.current?.click()}>＋ 画像を貼る</button></div>
+        <input ref={imageFileRef} hidden type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple onChange={event=>addCharacterImages(event.target.files)}/>
+        <div className="characterVisualGrid">{characterImages.filter(image=>image.workId===workId).map(image=><CharacterVisual key={image.id} image={image} onDelete={()=>deleteCharacterImage(image)}/>)}{!characterImages.some(image=>image.workId===workId)&&<button className="emptyVisual" onClick={()=>imageFileRef.current?.click()}>画像を選んでキャラクター資料を貼れます</button>}</div>
+        <p className="finePrint">JPEG・PNG・WebP・GIF、1枚10MBまで。画像も「保存・同期する」を押した時だけ別端末へ送ります。</p>
+      </section>
       <div className="chapterList">{chapters.filter(c=>c.workId===workId).sort((a,b)=>a.order-b.order).map(ch=><section className="chapter" key={ch.id}>
         <header><h2>{ch.title}</h2><div><button onClick={()=>rename("chapter",ch.id,ch.title)}>名前変更</button><button onClick={()=>deleteItem("chapter",ch.id)}>削除</button></div></header>
         <div>{scenes.filter(s=>s.chapterId===ch.id).sort((a,b)=>a.order-b.order).map(s=><article className="sceneRow" key={s.id} onClick={()=>chooseScene(s)}><span className="sceneDot"/><div><h3>{s.title}</h3><p>{count(s.content).toLocaleString()}字 · {fmt(s.updatedAt)}</p></div><div className="sceneActions"><button onClick={e=>{e.stopPropagation();moveScene(s,-1)}} aria-label="上へ">↑</button><button onClick={e=>{e.stopPropagation();moveScene(s,1)}} aria-label="下へ">↓</button><button onClick={e=>{e.stopPropagation();rename("scene",s.id,s.title)}}>編集</button><button onClick={e=>{e.stopPropagation();deleteItem("scene",s.id)}}>削除</button></div></article>)}</div>
@@ -639,7 +749,7 @@ export function WriterApp({ accountEmail = "この端末", signOutPath }: { acco
     </main>}
     {menu!=="none" && <div className="modalBackdrop" onMouseDown={()=>setMenu("none")}><section className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modalClose" onClick={()=>setMenu("none")}>×</button>
       {menu==="settings" && <><p className="eyebrow">PREFERENCES</p><h2>執筆設定</h2><label>表示テーマ<select value={settings.theme} onChange={e=>setSettings({...settings,theme:e.target.value as Settings["theme"]})}><option value="system">端末に合わせる</option><option value="light">ライト</option><option value="dark">ダーク</option></select></label><label>文字サイズ <b>{settings.fontSize}px</b><input type="range" min="15" max="24" value={settings.fontSize} onChange={e=>setSettings({...settings,fontSize:+e.target.value})}/></label><label>行間 <b>{settings.lineHeight}</b><input type="range" min="1.5" max="2.4" step=".1" value={settings.lineHeight} onChange={e=>setSettings({...settings,lineHeight:+e.target.value})}/></label><label>本文幅 <b>{settings.width}px</b><input type="range" min="560" max="980" step="20" value={settings.width} onChange={e=>setSettings({...settings,width:+e.target.value})}/></label><label>自動ロック<select value={settings.lockMinutes} onChange={e=>setSettings({...settings,lockMinutes:e.target.value})}><option value="1">1分</option><option value="5">5分</option><option value="15">15分</option><option value="30">30分</option><option value="close">アプリを閉じたときのみ</option></select></label><button className="primary wide" onClick={()=>{setPinMode("setup");setPin("");}}>PINを設定・変更</button>{pinMode==="setup"&&<div className="pinSetup"><input value={pin} onChange={e=>setPin(e.target.value.replace(/\D/g,"").slice(0,6))} type="password" inputMode="numeric" placeholder="4〜6桁"/><button onClick={submitPin}>設定</button><span>{pinError}</span></div>}</>}
-      {menu==="backup" && <><p className="eyebrow">BACKUP</p><h2>原稿を守る</h2><p className="modalCopy">バックアップには認証情報やPINは含まれません。</p><button className="primary wide" onClick={backup}>JSONバックアップを保存</button><button className="secondary wide" onClick={exportTxt} disabled={!currentWork}>現在の作品をTXT保存</button><button className="secondary wide" onClick={()=>fileRef.current?.click()}>JSONから復元</button><input ref={fileRef} hidden type="file" accept=".json,application/json" onChange={e=>e.target.files?.[0]&&restore(e.target.files[0])}/></>}
+      {menu==="backup" && <><p className="eyebrow">BACKUP</p><h2>原稿を守る</h2><p className="modalCopy">作品・本文・キャラクター画像をまとめて保存します。認証情報やPINは含まれません。</p><button className="primary wide" onClick={backup}>JSONバックアップを保存</button><button className="secondary wide" onClick={exportTxt} disabled={!currentWork}>現在の作品をTXT保存</button><button className="secondary wide" onClick={()=>fileRef.current?.click()}>JSONから復元</button><input ref={fileRef} hidden type="file" accept=".json,application/json" onChange={e=>e.target.files?.[0]&&restore(e.target.files[0])}/></>}
       {menu==="account" && <><p className="eyebrow">CLOUD SYNC</p><h2>クラウド同期</h2><div className="syncState"><span>●</span><div><b>{user ? `${user.email} で同期できます` : `${accountEmail}で利用中`}</b><p>執筆中はこの端末だけに保存します。「保存・同期する」を押した時だけ、PC・スマホ間で送受信します。</p></div></div>{user ? <><button className="primary wide" onClick={syncAll}>保存・同期する</button><button className="secondary wide" onClick={()=>supabase?.auth.signOut()}>Supabase同期を解除</button></> : <><label>同期用メールアドレス<input value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="you@example.com"/></label><label>同期用パスワード<input value={password} onChange={e=>setPassword(e.target.value)} type="password" minLength={8}/></label><button className="primary wide" onClick={()=>signIn(false)}>Supabase同期に接続</button><button className="secondary wide" onClick={()=>signIn(true)}>同期アカウントを新規登録</button></>}{signOutPath && <a className="secondary wide modalSignOut" href={signOutPath}>アプリからログアウト</a>}<p className="finePrint">{cloudMessage || (supabase ? "自動同期はしません。本文は入力中も端末内に自動保存されます。" : "端末間同期はSupabase設定後に利用できます。")}</p></>}
     </section></div>}
   </div>;
